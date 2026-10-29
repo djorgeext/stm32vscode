@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PCG viewer</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; margin: 1rem; color: #111; background: #fff; }
+  button { font: inherit; padding: 0.4rem 1.2rem; }
+  button:focus-visible, input:focus-visible { outline: 3px solid #0b57d0; outline-offset: 2px; }
+  #status { font-size: 1.1rem; }
+  figure { margin: 0; }
+  canvas { display: block; width: 100%; height: 60vh; border: 1px solid #767676; }
+</style>
+</head>
+<body>
+<h1>PCG viewer</h1>
+<p><button id="connect" type="button">Connect</button></p>
+<p id="status"><span id="msg" role="status">Starting. If this stays, serve the page from the repo root with
+  <code>python3 -m http.server -b 127.0.0.1 -d Projects/WeAct_MiniH750/Applications/USB_Device/PCG_CDC/Web 8000</code>
+  and open http://localhost:8000.</span> <span id="stats"></span></p>
+<p id="audiohelp">Turn the system volume down before the first Start audio. Audio starts at 10 % and fades in.</p>
+<p><button id="audio" type="button" aria-describedby="audiohelp">Start audio</button>
+  <!-- autocomplete="off": else a Back without the bfcache restores the old level under a "10" readout -->
+  <label for="vol">Volume (%)</label> <input id="vol" type="range" min="0" max="100" step="1" value="10" autocomplete="off">
+  <!-- aria-hidden: <output> is a live region, and the slider already announces its value -->
+  <output id="volout" for="vol" aria-hidden="true">10</output></p>
+<p><span id="amsg" role="status">Audio off.</span> <span id="astats"></span></p>
+<figure>
+  <canvas id="trace" role="img" aria-label="Live PCG trace of the last 5 seconds, newest on the right"></canvas>
+  <figcaption>PA6 band-passed 20–200 Hz on the board, sampled at 48 kHz. Last 5 s, newest on the right.
+    The vertical scale fits the largest sample in view (mV = counts × 3300 / 65536).</figcaption>
+</figure>
+<script type="module">
+import { createParser } from './pcg_parser.js';
+
+const RING = 5 * 48000; // 5 s, a whole number of 480-sample frames, so ring.set never wraps
+const MV_PER_COUNT = 3300 / 65536;
+const MIN_FULL_MV = 50; // keeps a quiet input flat instead of blowing ADC noise up to full height
+const ring = new Int16Array(RING);
+let written = 0, dirty = true, fullMv = MIN_FULL_MV;
+let port = null, reader = null, parser = null, stopping = false;
+let t0 = 0, w0 = 0;
+let actx = null, audioNode = null;
+
+const btn = document.getElementById('connect');
+const msg = document.getElementById('msg');
+const stats = document.getElementById('stats');
+const canvas = document.getElementById('trace');
+const ctx = canvas.getContext('2d');
+const abtn = document.getElementById('audio');
+const vol = document.getElementById('vol');
+const volOut = document.getElementById('volout');
+const amsg = document.getElementById('amsg');
+const astats = document.getElementById('astats');
+
+msg.textContent = 'Not connected.';
+if (!('serial' in navigator)) {
+  btn.disabled = true;
+  msg.textContent = isSecureContext
+    ? 'This browser has no Web Serial: open the page in Chrome or Edge.'
+    : `Web Serial needs a secure page and ${location.origin} is not one: open http://127.0.0.1:8000 instead.`;
+}
+
+btn.addEventListener('click', () => (port ? disconnect() : connect()));
+addEventListener('resize', () => (dirty = true));
+abtn.addEventListener('click', () => (actx ? stopAudio() : startAudio()));
+vol.addEventListener('input', () => {
+  volOut.value = vol.value;
+  audioNode?.parameters.get('volume').setTargetAtTime(vol.value / 100, actx.currentTime, 0.02);
+});
+// The back/forward cache restores the last level, and hearing safety wants every visit to start at 10 %
+addEventListener('pageshow', (e) => {
+  if (!e.persisted) return;
+  vol.value = 10;
+  vol.dispatchEvent(new Event('input')); // updates the <output>, and the node if audio survived the cache
+});
+
+async function connect() {
+  let p;
+  try {
+    p = await navigator.serial.requestPort({ filters: [{ usbVendorId: 0x0483, usbProductId: 0x5740 }] });
+    // CDC ignores the baud rate; the default 255-byte buffer is small for 96 KB/s
+    await p.open({ baudRate: 115200, bufferSize: 65536 });
+  } catch (e) {
+    msg.textContent = `Not connected: ${e.message}`;
+    return;
+  }
+  port = p;
+  stopping = false;
+  parser = createParser();
+  ring.fill(0);
+  written = w0 = 0;
+  t0 = performance.now();
+  dirty = true;
+  btn.textContent = 'Disconnect';
+  msg.textContent = 'Connected.';
+  stats.textContent = 'Measuring the sample rate…';
+  let error = '', frames = 0;
+  while (port.readable && !stopping) {
+    reader = port.readable.getReader();
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        for (const s of parser.push(value)) {
+          ring.set(s, written % RING);
+          written += s.length;
+          // The first frame after each open is the device's stale queued frame (step 4e): spliced before live audio it clicks
+          if (frames++ > 0) audioNode?.port.postMessage(s);
+        }
+        dirty = true;
+      }
+    } catch (e) {
+      // Unplugging is fatal (port.readable becomes null); an overrun is not, and reading resumes
+      error = e.message;
+      msg.textContent = `Read error: ${error}`;
+    } finally {
+      reader.releaseLock();
+    }
+  }
+  await port.close().catch(() => {}); // after an unplug the port is already gone
+  port = reader = parser = null;
+  btn.textContent = 'Connect';
+  msg.textContent = stopping ? 'Disconnected.' : `Connection lost: ${error || 'the port closed'}`;
+}
+
+function disconnect() {
+  stopping = true;
+  reader?.cancel().catch(() => {});
+}
+
+async function startAudio() {
+  const refocus = document.activeElement === abtn; // disabling drops focus, which strands a keyboard user
+  abtn.disabled = true;
+  try {
+    // Created inside the click (the autoplay rule) at the stream rate, so the page needs no resampler
+    actx = new AudioContext({ sampleRate: 48000 });
+    await actx.audioWorklet.addModule('pcg_audio.js');
+    const node = new AudioWorkletNode(actx, 'pcg-player', {
+      numberOfInputs: 0,
+      outputChannelCount: [1],
+      parameterData: { volume: vol.value / 100 },
+    });
+    node.port.onmessage = ({ data: s }) =>
+      (astats.textContent = `Audio: ${Math.round(s.fill / 48)} ms buffered, ${s.underruns} underruns, ${s.slips} slips.`);
+    node.connect(actx.destination);
+    audioNode = node;
+    abtn.textContent = 'Stop audio';
+    amsg.textContent = 'Audio on.';
+  } catch (e) {
+    actx?.close().catch(() => {});
+    actx = null;
+    abtn.textContent = 'Start audio';
+    amsg.textContent = `Audio failed: ${e.message}`;
+  }
+  abtn.disabled = false;
+  if (refocus && document.activeElement === document.body) abtn.focus(); // unless the user moved focus meanwhile
+}
+
+function stopAudio() {
+  const c = actx;
+  audioNode.port.onmessage = null;
+  // Glide to silence, then close, so the next start begins with an empty ring
+  audioNode.parameters.get('volume').setTargetAtTime(0, c.currentTime, 0.005);
+  setTimeout(() => c.close().catch(() => {}), 50);
+  actx = audioNode = null;
+  abtn.textContent = 'Start audio';
+  amsg.textContent = 'Audio off.';
+  astats.textContent = '';
+}
+
+// Smallest 1, 2 or 5 x 10^n at or above v, so the scale labels stay round
+function niceCeil(v) {
+  const p = 10 ** Math.floor(Math.log10(v));
+  return [1, 2, 5, 10].find((m) => m * p >= v) * p;
+}
+
+function draw() {
+  const dpr = devicePixelRatio || 1;
+  const W = Math.round(canvas.clientWidth * dpr), H = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width !== W || canvas.height !== H) {
+    canvas.width = W;
+    canvas.height = H;
+  }
+  // One min/max pair per pixel column; ring[written % RING] is the oldest sample
+  const lo = new Int16Array(W), hi = new Int16Array(W);
+  let peak = 0;
+  for (let x = 0; x < W; x++) {
+    let a = 32767, b = -32767;
+    for (let k = Math.floor((x * RING) / W), e = Math.floor(((x + 1) * RING) / W); k < e; k++) {
+      const v = ring[(written + k) % RING];
+      if (v < a) a = v;
+      if (v > b) b = v;
+    }
+    lo[x] = a;
+    hi[x] = b;
+    peak = Math.max(peak, -a, b);
+  }
+  // Symmetric around 0 and never below the peak, so no beat is clipped
+  fullMv = niceCeil(Math.max(peak * MV_PER_COUNT, MIN_FULL_MV));
+  const pad = 16 * dpr;
+  const y = (mv) => H / 2 - (mv / fullMv) * (H / 2 - pad);
+
+  const grid = [1, 0.5, 0, -0.5, -1].map((f) => [f * fullMv, Math.round(y(f * fullMv))]);
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#d0d0d0';
+  for (const [, yy] of grid) ctx.fillRect(0, yy, W, dpr);
+  ctx.beginPath();
+  for (let x = 0; x < W; x++) {
+    ctx.lineTo(x + 0.5, y(hi[x] * MV_PER_COUNT));
+    ctx.lineTo(x + 0.5, y(lo[x] * MV_PER_COUNT));
+  }
+  ctx.lineWidth = dpr;
+  ctx.strokeStyle = '#b00020';
+  ctx.stroke();
+  // Labels last, with a white halo, so the trace never hides them
+  ctx.font = `${13 * dpr}px system-ui, sans-serif`;
+  ctx.lineWidth = 4 * dpr;
+  ctx.strokeStyle = '#fff';
+  ctx.fillStyle = '#222';
+  for (const [mv, yy] of grid) {
+    ctx.strokeText(`${mv} mV`, 4 * dpr, yy - 3 * dpr);
+    ctx.fillText(`${mv} mV`, 4 * dpr, yy - 3 * dpr);
+  }
+}
+
+function tick() {
+  requestAnimationFrame(tick);
+  const now = performance.now();
+  if (dirty) {
+    dirty = false;
+    draw();
+  }
+  if (parser && now - t0 >= 1000) {
+    const rate = Math.round(((written - w0) * 1000) / (now - t0));
+    t0 = now;
+    w0 = written;
+    stats.textContent = `${rate} samples/s, dropped frames: ${parser.stats.drops}, scale ±${fullMv} mV.`;
+  }
+}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
