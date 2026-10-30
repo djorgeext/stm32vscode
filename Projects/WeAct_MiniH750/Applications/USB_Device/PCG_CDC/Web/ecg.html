@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ECG viewer</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; margin: 1rem; color: #111; background: #fff; }
+  button { font: inherit; padding: 0.4rem 1.2rem; }
+  button:focus-visible { outline: 3px solid #0b57d0; outline-offset: 2px; }
+  #status { font-size: 1.1rem; }
+  figure { margin: 0; }
+  canvas { display: block; width: 100%; height: 60vh; border: 1px solid #767676; }
+</style>
+</head>
+<body>
+<h1>ECG viewer (lead I)</h1>
+<p><button id="connect" type="button">Connect</button></p>
+<p id="status"><span id="msg" role="status">Starting. If this stays, serve the page from the repo root with
+  <code>python3 -m http.server -b 127.0.0.1 -d Projects/WeAct_MiniH750/Applications/USB_Device/PCG_CDC/Web 8000</code>
+  and open http://localhost:8000/ecg.html.</span> <span id="stats"></span></p>
+<p id="leads" role="status"></p>
+<figure>
+  <canvas id="trace" role="img" aria-label="Live ECG, lead I, last 5 seconds, newest on the right"></canvas>
+  <figcaption>Lead I (LA − RA), 500 samples/s, filtered on the PC: 0.5–150 Hz band-pass and 50 Hz notch.
+    Last 5 s, newest on the right. The scale is in ADC counts, because the module's µV per count is not known.
+    For about 7 s after Connect the trace shows the module's input settling.</figcaption>
+</figure>
+<script type="module">
+import { createParser, createEcgFilter, RATE } from './ecg_dsp.js';
+
+const RING = Math.round(5 * RATE); // 5 s
+const MIN_FULL = 50; // counts: QRS is about 40 and noise about ±4, so a quiet trace stays flat instead of filling the height
+const ring = new Float32Array(RING); // filtered values are fractional, and after a step to the rail they exceed int16
+let written = 0, dirty = true, full = MIN_FULL;
+let port = null, reader = null, parser = null, filter = null, stopping = false;
+let t0 = 0, w0 = 0, keepAliveAt = 0;
+let writes = Promise.resolve();
+
+const btn = document.getElementById('connect');
+const msg = document.getElementById('msg');
+const stats = document.getElementById('stats');
+const leads = document.getElementById('leads');
+const canvas = document.getElementById('trace');
+const ctx = canvas.getContext('2d');
+
+msg.textContent = 'Not connected.';
+if (!('serial' in navigator)) {
+  btn.disabled = true;
+  msg.textContent = isSecureContext
+    ? 'This browser has no Web Serial: open the page in Chrome or Edge.'
+    : `Web Serial needs a secure page and ${location.origin} is not one: open http://127.0.0.1:8000/ecg.html instead.`;
+}
+
+btn.addEventListener('click', () => (port ? disconnect() : connect()));
+addEventListener('resize', () => (dirty = true));
+
+// Every write goes through this one chain, so the stop bytes always follow any queued start or keep-alive
+// and two writes never fight over the writer lock. Sends `first`, waits `ms`, sends `then` (protocol §6–§7).
+function send(first, ms, then) {
+  const p = port;
+  writes = writes
+    .then(async () => {
+      const w = p.writable.getWriter();
+      try {
+        await w.write(new Uint8Array(first));
+        await new Promise((r) => setTimeout(r, ms));
+        await w.write(new Uint8Array(then));
+      } finally {
+        w.releaseLock();
+      }
+    })
+    .catch(() => {}); // an unplug: the read loop reports it, and the chain must keep working for the next connection
+  return writes;
+}
+
+async function connect() {
+  btn.disabled = true; // port stays null until open settles, so a second click would start a second connect on the same port
+  let p, opened = false;
+  try {
+    p = await navigator.serial.requestPort({ filters: [{ usbVendorId: 0x04d8, usbProductId: 0x00df }] });
+    // The MCP2200 is a real UART bridge, so the baud rate matters; the buffer holds 3 s at 20 KB/s
+    await p.open({ baudRate: 230400, bufferSize: 65536 });
+    opened = true;
+    await p.setSignals({ dataTerminalReady: false, requestToSend: false }); // as the vendor program
+  } catch (e) {
+    if (opened) p.close().catch(() => {}); // a failed setSignals leaves our port open; after a failed open, p may be another caller's
+    msg.textContent = `Not connected: ${e.message}`;
+    return;
+  } finally {
+    btn.disabled = false;
+    if (document.activeElement === document.body) btn.focus(); // disabling dropped focus, which strands a keyboard user
+  }
+  port = p;
+  stopping = false;
+  parser = createParser();
+  filter = createEcgFilter();
+  keepAliveAt = 30000;
+  ring.fill(0);
+  written = w0 = 0;
+  t0 = performance.now();
+  dirty = true;
+  btn.textContent = 'Disconnect';
+  msg.textContent = 'Connected.';
+  stats.textContent = 'Measuring the frame rate…';
+  send([0x01], 100, [0x01, 0x09]); // start; no purge in Web Serial, so the marker hunt drops the start-up junk
+  let error = '';
+  while (port.readable && !stopping) {
+    reader = port.readable.getReader();
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        for (const v of parser.push(value)) ring[written++ % RING] = filter(v);
+        // Keep-alive every 30 000 frames (60 s) like the vendor program: counted, as Chrome throttles timers in hidden tabs
+        if (parser.stats.frames >= keepAliveAt) {
+          keepAliveAt += 30000;
+          send([0x09], 5, [0x09]);
+        }
+        dirty = true;
+      }
+    } catch (e) {
+      // Unplugging is fatal (port.readable becomes null); an overrun is not, and reading resumes
+      error = e.message;
+      msg.textContent = `Read error: ${error}`;
+    } finally {
+      reader.releaseLock();
+    }
+  }
+  await port.close().catch(() => {}); // after an unplug the port is already gone
+  port = reader = parser = filter = null;
+  btn.textContent = 'Connect';
+  btn.disabled = false;
+  if (stopping && document.activeElement === document.body) btn.focus(); // disabling dropped focus, which strands a keyboard user
+  leads.textContent = '';
+  msg.textContent = stopping ? 'Disconnected.' : `Connection lost: ${error || 'the port closed'}`;
+}
+
+async function disconnect() {
+  btn.disabled = true;
+  keepAliveAt = Infinity; // no keep-alive may follow the stop bytes
+  const p = port;
+  // writable.close() drains the OS transmit buffer, whereas port.close() aborts it and drops the last stop byte
+  await send([0x02], 100, [0x02]).then(() => p.writable.close()).catch(() => {}); // an unplug fails the drain: stop anyway
+  stopping = true;
+  reader?.cancel().catch(() => {});
+}
+
+// Smallest 1, 2 or 5 x 10^n at or above v, so the scale labels stay round
+function niceCeil(v) {
+  const p = 10 ** Math.floor(Math.log10(v));
+  return [1, 2, 5, 10].find((m) => m * p >= v) * p;
+}
+
+function draw() {
+  const dpr = devicePixelRatio || 1;
+  const W = Math.round(canvas.clientWidth * dpr), H = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width !== W || canvas.height !== H) {
+    canvas.width = W;
+    canvas.height = H;
+  }
+  // One min/max pair per pixel column; ring[written % RING] is the oldest sample
+  const lo = new Float32Array(W), hi = new Float32Array(W);
+  let peak = 0;
+  for (let x = 0; x < W; x++) {
+    let a = Infinity, b = -Infinity;
+    // At least one sample per column: the 2500-sample ring can be narrower than the canvas
+    for (let k = Math.floor((x * RING) / W), e = Math.max(k + 1, Math.floor(((x + 1) * RING) / W)); k < e; k++) {
+      const v = ring[(written + k) % RING];
+      if (v < a) a = v;
+      if (v > b) b = v;
+    }
+    lo[x] = a;
+    hi[x] = b;
+    peak = Math.max(peak, -a, b);
+  }
+  // Symmetric around 0 and never below the peak, so no beat is clipped
+  full = niceCeil(Math.max(peak, MIN_FULL));
+  const pad = 16 * dpr;
+  const y = (c) => H / 2 - (c / full) * (H / 2 - pad);
+
+  const grid = [1, 0.5, 0, -0.5, -1].map((f) => [f * full, Math.round(y(f * full))]);
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#d0d0d0';
+  for (const [, yy] of grid) ctx.fillRect(0, yy, W, dpr);
+  ctx.beginPath();
+  for (let x = 0; x < W; x++) {
+    ctx.lineTo(x + 0.5, y(hi[x]));
+    ctx.lineTo(x + 0.5, y(lo[x]));
+  }
+  ctx.lineWidth = dpr;
+  ctx.strokeStyle = '#b00020';
+  ctx.stroke();
+  // Labels last, with a white halo, so the trace never hides them
+  ctx.font = `${13 * dpr}px system-ui, sans-serif`;
+  ctx.lineWidth = 4 * dpr;
+  ctx.strokeStyle = '#fff';
+  ctx.fillStyle = '#222';
+  for (const [c, yy] of grid) {
+    ctx.strokeText(`${c} counts`, 4 * dpr, yy - 3 * dpr);
+    ctx.fillText(`${c} counts`, 4 * dpr, yy - 3 * dpr);
+  }
+}
+
+function tick() {
+  requestAnimationFrame(tick);
+  const now = performance.now();
+  if (dirty) {
+    dirty = false;
+    draw();
+  }
+  if (parser?.stats.frames) {
+    const { raOff, laOff } = parser.stats;
+    const off = raOff && laOff ? 'RA and LA electrodes' : raOff ? 'RA electrode' : laOff ? 'LA electrode' : '';
+    const t = off ? `Lead I not valid: ${off} off.` : 'RA and LA electrodes on.';
+    if (leads.textContent !== t) leads.textContent = t; // a live region announces every write
+  }
+  if (parser && now - t0 >= 1000) {
+    const rate = Math.round(((written - w0) * 1000) / (now - t0));
+    t0 = now;
+    w0 = written;
+    stats.textContent = `${rate} frames/s, ${parser.stats.skipped} bytes skipped while syncing, scale ±${full} counts.`;
+  }
+}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>

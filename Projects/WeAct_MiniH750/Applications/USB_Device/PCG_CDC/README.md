@@ -46,6 +46,29 @@ Then, from the repo root, serve the page and open http://localhost:8000:
 python3 -m http.server -b 127.0.0.1 -d Projects/WeAct_MiniH750/Applications/USB_Device/PCG_CDC/Web 8000
 ```
 
+## ECG viewer (Biomedic ECG module)
+
+`Web/ecg.html` reads the Biomedic ECG module's USB serial port (MCP2200, VID:PID `04d8:00df`, 230400 baud) with
+Web Serial and draws lead I (LA − RA) for the last 5 s at 500 samples/s. It also shows the frame rate, the bytes
+skipped while syncing and whether the RA and LA electrodes are on. `Web/ecg_dsp.js` filters on the PC: a 0.5–150 Hz
+band-pass (2nd-order Butterworth high-pass and low-pass) and a 50 Hz notch (Q 30). The first ~7 s after Connect
+show the module's input settling. The scale is in ADC counts, because the module's µV per count is not known.
+The protocol is described in `Biomedic_ECG_USB_protocol.md` at the repo root. From this folder, check the parser and the filters:
+
+```
+node Tests/ecg_dsp_test.mjs
+```
+
+Then, from the repo root, serve the page and open http://localhost:8000/ecg.html:
+
+```
+python3 -m http.server -b 127.0.0.1 -d Projects/WeAct_MiniH750/Applications/USB_Device/PCG_CDC/Web 8000
+```
+
+Click Disconnect before closing the tab: it sends the module's stop command, and closing the tab does not.
+
+Troubleshooting: if Connect reports "The device has been lost." right away, another tool (pyserial, including the reference script in `Biomedic_ECG_USB_protocol.md` §11) left the port at `min 0`. Run `stty -F /dev/ttyACM0 min 1 time 0`, or replug the module.
+
 ## Flash
 
 From the repo root, with the Atmel-ICE on SWD (see `PLAN.md` step 4 for the safe-flash checklist):

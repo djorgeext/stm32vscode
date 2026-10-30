@@ -112,3 +112,351 @@ Raw (unfiltered) stream, decimation (all 48 kHz filtered samples go on the wire)
 - Many headphones and earbuds roll off below about 50–100 Hz, and hearing is less sensitive there, so heart sounds can be faint. Raise the level in small steps.
 - Do the headphone check in step 6c and report what you hear: the agent cannot hear it.
 - Open question: the audio runs about 100 ms behind the trace, because that buffer absorbs USB and drawing jitter. Say if that is too much. 50 ms is possible, at a higher risk of gaps.
+
+# PLAN: ECG viewer (Biomedic ECG, lead I)
+
+**Goal:** draw lead I of the Biomedic ECG module live in Chrome, read from its USB serial port and filtered on the PC with a 0.5–150 Hz band-pass and a 50 Hz IIR notch.
+
+## Decisions
+
+- **Where:** everything goes in `PCG_CDC/`, because the user asked for the PCG page's folder:
+  - `Web/ecg.html`: the new page.
+  - `Web/ecg_dsp.js`: the existing draft, adopted.
+  - `Tests/ecg_dsp_test.mjs`: the new self-check.
+  - `README.md`: a new "ECG viewer" section.
+
+  The same `http.server` command serves both pages, and the ECG page is at `http://localhost:8000/ecg.html`. `index.html`, `pcg_parser.js`, `pcg_audio.js` and their tests stay byte-identical, so the PCG page keeps working. No firmware, CMake, linker, HAL, `.vscode` or guide change.
+- **Data path:** Web Serial on the module's MCP2200 CDC-ACM port (`04d8:00df`, `/dev/ttyACM0` through Linux `cdc_acm`, verified), opened with `{ baudRate: 230400, bufferSize: 65536 }`.
+  - 8N1 with no flow control is the Web Serial default.
+  - The baud rate matters here, because the MCP2200 is a real UART bridge (protocol §3).
+  - The buffer holds 3 s at 20 KB/s. The 255-byte default is too small.
+  - This is a platform feature: no driver, no backend, no npm.
+- **pyserial breaks the next Chrome Connect (confirmed 2026-10-30, after the first E3 run):**
+  - Symptom: Connect fails within 1 s with "Connection lost: The device has been lost.", while the module stays on USB.
+  - Cause: pyserial 3.5 opens the port with VMIN 0 and VTIME 0 (`serialposix.py` lines 393, 510 and 514) and never restores them. Linux keeps tty settings across opens until the module is replugged.
+  - Chrome sets raw mode but leaves VMIN and VTIME as it finds them. It reads at once and treats `read() == 0` as "device lost". On this kernel, a non-blocking raw tty returns 0 on an empty buffer with VMIN 0, and EAGAIN with VMIN 1 (tester's pty test).
+  - The page cannot fix it, because Web Serial has no VMIN control.
+  - **Fix in the plan's commands:** set `p.inter_byte_timeout = 0.05` before `open`. pyserial then sets VMIN 1 and VTIME `int(0.05 * 10)` = 0, the cdc_acm plug-in default, and never sets VMIN 0. The port is therefore right after an error, Ctrl-C or a killed process too, which a `finally` that resets termios would not cover.
+  - pyserial's Linux `read()` ignores `inter_byte_timeout` and times out with `select` (line 553 on), so reads are unchanged.
+  - Anyone else: run `stty -F /dev/ttyACM0 min 1 time 0`, or replug the module.
+- **Session:** the commands follow protocol §5–§7 and the verified capture, plus a stop before the start:
+  - Right after `open`, call `setSignals({ dataTerminalReady: false, requestToSend: false })`.
+  - **Connect:** the stop `02`, wait 100 ms, `02`, then wait 100 ms (the vendor's spacing between commands), then the start `01`, wait 100 ms, `01`, `09`. The vendor program sends only the start. Why the page adds the stop: next decision.
+  - **Keep-alive:** `09`, wait 5 ms, `09` every 30 000 frames. Count frames like the vendor program does, not with a timer, because Chrome throttles timers in hidden tabs.
+  - **Disconnect:** `02`, wait 100 ms, `02`, then `await port.writable.close()`, then cancel the reader and close the port.
+    - `writable.close()` drains the OS transmit buffer. `port.close()` alone aborts it and can drop the last stop byte.
+    - This drain fix has been in `Web/ecg.html` since the second E3 run. Its effect is not known yet (next decision).
+  - **No buffer purge:** Web Serial has none, so the marker hunt drops the start-up junk instead. On the real capture that was 78 bytes, because the module's first blocks carry `01 00`, `02 00`, `03 00` instead of `xx C0`.
+  - **One write queue:** every write goes through one promise chain that catches errors (for example an unplug). The stop bytes then always follow any queued start or keep-alive bytes, and two writes never fight over the writer lock.
+- **Stop before start on every Connect, because the module can stop obeying commands (E3 second run, evidence there):**
+  - **Why the page differs from the vendor:** the vendor program ends every session with a stop, so its start always reaches an idle module. A tab can close, crash or lose the port before Disconnect, so the page cannot promise the stop at the end. It sends the stop at the start instead, for 200 ms more per Connect.
+  - **Candidate triggers, all unproven:**
+    - (a) A start received while streaming.
+    - (b) A start cut off between `01` and `01 09`.
+    - (c) The module's UART receiver locked after an overrun, which is common on PIC parts.
+    - (d) Streaming for minutes with nobody reading (planner's addition).
+
+    The PC only sees that USB delivered the bytes, so the deaf part may also be the MCP2200's UART side.
+  - **What the stop-first Connect covers:**
+    - It removes (a) as long as the module still obeys.
+    - The double-connect bug, which may have cut a start (b), and VMIN 0, which ended sessions without a stop, are already fixed.
+    - (c) and (d) are not addressed. The page never sends more than two command bytes back to back, except when Disconnect is clicked during the 0.3 s Connect sequence.
+  - **A stop reaching an idle module is probably harmless:** the vendor's second `02` already does that, and the module started again after E1's stop. E3 item 7.1 checks it.
+  - **The trigger itself is not tested:** each positive test can lock the module and cost a replug, and no answer would change the page, whose only lever is the order of the bytes it sends. E3 item 7 instead tests the case users meet: a tab closed without Disconnect, then a new Connect.
+  - **Recovery from a deaf module:** unplug and replug it. Nothing the PC can send is known to help.
+- **Parser:** adopt the draft's `createParser` as it is.
+  - It uses the vendor's six-marker check with a byte-by-byte hunt (§8.1).
+  - Lead I is the big-endian int16 at offset 6.
+  - RA off is `B1 & 0x60`, and LA off is `A1 & 0x20` (§8.3).
+  - The LL flag (`A1 & 0xC0`) is ignored, because lead I does not use LL. It is set on the real device, since no LL electrode is fitted.
+  - Planner's check on the real capture, fed in 777-byte chunks: 1955 frames, 78 bytes skipped and lead I from −4488 to 4715. This matches the Python marker check exactly.
+- **Electrode off:** a `role="status"` line reads "RA and LA electrodes on." or "Lead I not valid: LA electrode off." (RA, or both, likewise). It is updated only when its text changes.
+  - Lead I is not zeroed the way the vendor program does it. The status line gives the same information, and the data and filter state stay untouched.
+  - Neither flag has fired on real hardware yet, so in E3 the user unclips LA to prove it.
+- **Filters:** adopt the draft chain unchanged:
+  - The chain, in order: a 2nd-order Butterworth high-pass at 0.5 Hz, a 2nd-order Butterworth low-pass at 150 Hz (together, the band-pass), then an RBJ notch at 50 Hz with Q 30.
+  - Each stage is a biquad in double-precision DF2T. The first sample is subtracted, so the chain starts settled.
+  - Planner's check: on the real capture the chain matches scipy (`butter` plus the same notch) to within 3e-9 counts.
+  - RMS gains: 0.5 Hz −3.01 dB, 10 Hz 0.00 dB, 49 Hz −2.05 dB, 51 Hz −2.11 dB, 50 Hz −247 dB and 150 Hz −3.01 dB.
+  - A constant input gives exact zeros.
+  - The chain is causal, as a live view must be. The group delay is 1 sample at 10 Hz and 67 samples (134 ms) at 1 Hz. That bends slow waves slightly, which is acceptable for viewing.
+  - Only change: fix the notch comment. It says "about 1.7 Hz wide", but the −3 dB band is 1.56 Hz (49.22–50.79 Hz).
+- **Notch Q 30 depends on the sample rate:**
+  - A 40-count QRS-like pulse makes the notch ring by only 0.007 counts.
+  - But the notch attenuates only 12 dB at ±0.2 Hz from 50 Hz. If the module runs 0.4 % slow, mains lands at 50.2 Hz in the filter's time, so the notch is only as good as `RATE`.
+  - The 4 s capture (489 frames/s) cannot tell a slow clock from start-up delay, because its timer started after the 100 ms wait. E1 therefore measures the rate over 10 s.
+  - `RATE` stays 500 (§8) if E1 measures 499.5–500.5 frames/s (within 0.1 %). Otherwise E2 sets `RATE` to the measured value.
+  - The current capture shows no 50 Hz peak above the ±4-count noise; the largest bins are QRS energy at 7–18 Hz. The notch is there because the user asked, and for setups that do pick up hum.
+- **Amplitude in counts:** the scale labels and the caption say "counts".
+  - The µV per count is unknown (§12, question 1).
+  - The ADS1194 front-end chip is only inferred (§3), and its PGA gain (1 to 12) is unknown, so a mV scale could be wrong by a factor of 12.
+  - For the record only, not a source: at gain 6 with a 2.4 V reference, 1 count would be 12.2 µV. The measured QRS of about 40 counts would then be about 0.5 mV, which is plausible for lead I.
+- **Display:** reuse the PCG page's `draw()` and its stats pattern.
+  - The trace shows the last 5 s (`RING = Math.round(5 * RATE)` samples), newest on the right, as one min/max pair per pixel column.
+  - The autoscale is symmetric, rounded up to a 1-2-5 step, with a floor of ±50 counts (QRS about 40 counts, noise about ±4).
+  - **Change 1:** the ring is a `Float32Array`. Filtered values are fractional, and after a step to the rail they exceed int16.
+  - **Change 2:** every pixel column covers at least one sample. The PCG ring (240 000 samples) is always wider than the canvas. 2500 samples can be fewer than the device pixels of a wide or zoomed window, and the copied loop would then draw the empty columns as ±32767 spikes.
+- **Start-up swing:** on the real capture the module's input settles over about 3 s after start, from −4488 to +4700 counts.
+  - The 0.5 Hz high-pass turns that into a swing of +1500/−500 counts, which is gone after about 2.5 s.
+  - The ECG becomes readable about 7 s after Connect, once the swing has left the 5 s window and the autoscale shrinks.
+  - The caption says so. It is not filtered away.
+- **Test data:** `Tests/ecg_dsp_test.mjs` uses `node:test` and `node:assert/strict` on synthetic frames only. Real captures are the user's ECG: they stay in `/tmp` and never go into the repo or into a fixture.
+
+## Steps
+
+Commands run from `Projects/WeAct_MiniH750/Applications/USB_Device/PCG_CDC` unless they say "repo root".
+
+Two rules for anything that touches the device:
+
+- Only two commands ever send to or read from the device. The capture command uses the vendor sequence and always ends with the stop bytes. The listen command sends nothing.
+- Both find the port by VID:PID, because the PCG board also shows up as `ttyACM*`.
+- Both set `p.inter_byte_timeout = 0.05` before `open`, so they leave the port at `min 1 time 0`, even on an error (Decisions, "pyserial breaks the next Chrome Connect"). Never drop that line: without it, the next Connect in Chrome fails with "The device has been lost."
+- After either command, `stty -F /dev/ttyACM0 -a | grep -o 'min = [0-9]*; time = [0-9]*'` must print `min = 1; time = 0`. `stty` sends nothing to the module.
+
+Run the Python blocks exactly as written: the heredocs must stay unindented.
+
+- [x] E1. **Real stream and sample rate (tester only, no code).**
+  **Result (2026-10-30):** 500.12 frames/s over 10 s (inside 499.5–500.5, `RATE` stays 500); lock_at 77, 0 skipped after lock, 5956 frames; RA_off 0, LA_off 0, LL_off 5543 (A1 = 0x00 for the first 413 frames, ~0.83 s, then 0xC0); lead I −4206…−2302; listen after stop: 0 bytes in 2 s.
+  **Note (18:20):** as first run, these commands left `/dev/ttyACM0` at `min 0`, which broke the first E3 Connect. The tester reset it with `stty -F /dev/ttyACM0 min 1 time 0`. The commands below now carry the fix, so running them again is safe.
+  Before starting:
+  - The user has RA, LA and RL on and sits still.
+  - No page has the port open: `fuser /dev/ttyACM0` prints nothing.
+
+  The capture runs 12 s with the vendor sequence and writes `/tmp/ecg.bin`. The planner ran this exact script against a paced fake device on a pty. For 500 and 489 frames/s it measured 500.05 and 489.00, and the device received `01 01 09 02 02`. After the VMIN fix it measured 500.04 frames/s and the same bytes. On a pty set to VMIN 0 first, the capture and the listen both left VMIN 1, VTIME 0. The listen without the new line left VMIN 0.
+
+```
+python3 - <<'EOF'
+import sys, time, serial
+from serial.tools import list_ports
+dev = [q.device for q in list_ports.comports() if (q.vid, q.pid) == (0x04D8, 0x00DF)]
+if not dev: sys.exit("ECG module 04d8:00df not found")
+p = serial.Serial(); p.port, p.baudrate, p.timeout = dev[0], 230400, 2
+p.dtr = p.rts = False
+p.inter_byte_timeout = 0.05  # pyserial then sets VMIN 1, VTIME 0, not VMIN 0, which outlives close and breaks Chrome's next Connect
+p.open()
+buf = bytearray(); mark = None
+try:
+    p.reset_input_buffer(); p.write(b"\x01"); time.sleep(0.1)
+    p.reset_input_buffer(); p.write(b"\x01"); p.write(b"\x09")
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 12:
+        buf += p.read(p.in_waiting or 1)
+        if mark is None and time.monotonic() - t0 >= 2: mark = (len(buf), time.monotonic())
+    rate = (len(buf) - mark[0]) / (time.monotonic() - mark[1]) / 40
+finally:
+    p.write(b"\x02"); time.sleep(0.1); p.write(b"\x02"); p.close()
+open("/tmp/ecg.bin", "wb").write(buf)
+d = bytes(buf); M = (1, 0xC0, 2, 0xC0, 3, 0xC0); i = 0; lock = None; skip = 0; f = []
+while i + 40 <= len(d):
+    if (d[i], d[i+1], d[i+12], d[i+13], d[i+24], d[i+25]) == M:
+        lock = i if lock is None else lock; f.append(d[i:i+40]); i += 40
+    else:
+        skip += lock is not None; i += 1
+I = [int.from_bytes(x[6:8], "big", signed=True) for x in f]
+print(f"{dev[0]} bytes {len(d)} lock_at {lock} frames {len(f)} skipped_after_lock {skip} rate {rate:.2f} frames/s",
+      f"RA_off {sum(x[3] & 0x60 > 0 for x in f)} LA_off {sum(x[2] & 0x20 > 0 for x in f)} LL_off {sum(x[2] & 0xC0 > 0 for x in f)}",
+      f"leadI {min(I)}..{max(I)}")
+EOF
+```
+
+  Then the listen command checks that the stop bytes really stopped the module. It opens the port for 2 s and sends nothing:
+
+```
+python3 - <<'EOF'
+import serial
+from serial.tools import list_ports
+p = serial.Serial(); p.baudrate, p.timeout = 230400, 2; p.dtr = p.rts = False
+p.inter_byte_timeout = 0.05  # leaves VMIN 1, VTIME 0 for Chrome, as in the capture
+p.port = [q.device for q in list_ports.comports() if (q.vid, q.pid) == (0x04D8, 0x00DF)][0]
+p.open(); print(len(p.read(100000)), "bytes in 2 s, nothing sent"); p.close()
+EOF
+```
+
+  **Acceptance:**
+  - The capture line shows:
+    - `lock_at` ≤ 120 and `skipped_after_lock 0`.
+    - `frames` ≥ 5800.
+    - `RA_off 0` and `LA_off 0`.
+    - Lead I strictly inside −32768…32767.
+  - Record `rate`. If it is outside 499.5–500.5, E2 sets `RATE` to it.
+  - The listen prints fewer than 1000 bytes. A few stale bytes from the bridge are fine. A module that is still streaming gives about 40 000.
+- [x] E2. **Parser and filter, with the self-check.** Files:
+  - `Web/ecg_dsp.js`: the draft, adopted. The only edits are the notch comment fix and `RATE` if E1 requires it.
+  - `Tests/ecg_dsp_test.mjs`: new. Its header comment reads "From the project folder: node Tests/ecg_dsp_test.mjs", like `pcg_parser_test.mjs`.
+
+  The test asserts:
+  1. **Values and offsets.** Build frames as in §8, with distinct values in V5, I, II and III. Lead I values −32768, −1, 0, 32767 and −4488 come out in order, so a wrong offset or a little-endian read fails.
+  2. **Chunking.** The output is the same for the whole buffer at once, 1-byte chunks, chunks cycling through 39/40/41 bytes, and seeded random chunks of 1–200 bytes.
+  3. **Start-up junk.** Put the module's start-up blocks before valid frames: first `01 00` … `02 00` … `03 00`, then `01 00` with `02 C0` and `03 C0`, then a partial frame. None of them is emitted, `skipped` equals their byte count, and the first valid frame comes out first.
+  4. **Re-sync.** Insert 333 seeded random bytes between valid frames, and in a separate case a frame cut after 20 bytes. Every valid frame comes out, the cut frame does not, and `skipped` grows by exactly the number of inserted bytes.
+  5. **Flags.**
+     - `A1 = 0xC0` (the real device, where LL is off) gives `raOff` false and `laOff` false.
+     - `A1 = 0x20` and `A1 = 0xE0` give `laOff`.
+     - `B1 = 0x20` and `B1 = 0x40` give `raOff`.
+     - A clean frame afterwards clears both.
+  6. **Response.** Feed 30 s sines of amplitude 1000 at `RATE`. Measure the gain from the RMS of the last 10 s, not the peak: at 150 Hz the 500 Hz samples fall on only 10 phases. Expected:
+     - 10 Hz within ±0.1 dB of 0 dB.
+     - 0.5 Hz and 150 Hz at −3.01 ± 0.1 dB.
+     - 50 Hz below −40 dB.
+     - 48 Hz and 52 Hz above −1 dB.
+  7. **Start and DC.**
+     - A constant 3000 for 10 s gives exactly 0 on every sample.
+     - A +100-count step at 1 s is within ±1 count from 4 s on. The planner measured 0.90 at 3 s and 0.02 at 6 s.
+
+  **Acceptance:**
+  - `node Tests/ecg_dsp_test.mjs`, `node Tests/pcg_parser_test.mjs` and `node Tests/pcg_audio_test.mjs` all end with `fail 0`.
+  - Replay the E1 capture through the module:
+    ```
+    node --input-type=module -e "import {readFileSync} from 'node:fs'; import {createParser, createEcgFilter, RATE} from './Web/ecg_dsp.js'; const d=readFileSync('/tmp/ecg.bin'); const p=createParser(), f=createEcgFilter(), y=[]; for (let i=0;i<d.length;i+=777) for (const v of p.push(d.subarray(i,i+777))) y.push(f(v)); const late=y.slice(5*RATE); console.log('frames',p.stats.frames,'skipped',p.stats.skipped,'finite',y.every(Number.isFinite),'after 5 s',Math.min(...late).toFixed(0)+'..'+Math.max(...late).toFixed(0))"
+    ```
+    It must print:
+    - `frames` equal to E1's `frames`.
+    - `skipped` equal to E1's `lock_at` plus `skipped_after_lock`.
+    - `finite true`.
+
+    Report the range after 5 s. On the 4 s capture, filtered lead I was about −175…−5 counts between 2 s and 4 s, still settling.
+- [ ] E3. **Page and README.** Files: `Web/ecg.html` (new) and `README.md` (a new section after "Browser viewer"). Build `Web/ecg.html` from `index.html` and drop everything to do with audio.
+  **First run (2026-10-30):** Connect failed within 1 s with "Connection lost: The device has been lost.". The cause was E1's pyserial commands, not the page (Decisions). The only change left is the README troubleshooting line below.
+  **Second run (2026-10-30):** items 1–5 worked (3+ min, keep-alives at 60, 120 and 180 s). They did not test the start, because the module was already streaming. In items 6 and 7 the module kept streaming after Disconnect: the listens got 40 011 B (old `port.close()`) and 40 021 B (drain fix). The tester then found that it ignores every command (18:52–18:54):
+  - Two pyserial runs of `01`, 100 ms, `01 09` … `02`, 100 ms, `02` each left it streaming, at about 40 000 B in 2 s.
+  - The bytes reached the MCP2200, because pyserial's close did not wait out the 30 s closing_wait. The kernel log shows no USB event since 17:19.
+  - Those starts did not restart it: lock_at 26 and 19, no start-up blocks, LL flagged from frame 1 and lead I flat at 1526–2066. A real start looks like E1: lock_at 77, the `01 00`/`02 00`/`03 00` blocks, A1 = 0x00 for the first ~413 frames and a settling swing.
+  - It obeyed both commands in E1. After E1 it received, in order:
+    1. A start that the double-connect bug may have cut off before `01 09`, and no stop.
+    2. A start at 18:11 and no stop (VMIN 0; the tab held the port until about 18:19).
+    3. A start while already streaming, then a stop through the old `port.close()` (items 1–5).
+    4. A start while streaming, then a stop with the drain fix (item 7).
+
+    It went deaf somewhere in 1–4, so the drain fix is untested, not disproved.
+
+  **Changes left:** the stop-first Connect (Decisions), a README recovery line, and items 6–7 below, run on a freshly replugged module. The rest of the spec below is unchanged.
+  - **Markup:**
+    - `<h1>ECG viewer (lead I)</h1>` and the Connect button.
+    - `#msg` with `role="status"` (the same "serve the page" hint, with the URL ending in `/ecg.html`) and `#stats`.
+    - `<p id="leads" role="status">` for the electrode line.
+    - A `<figure>` with `<canvas role="img" aria-label="Live ECG, lead I, last 5 seconds, newest on the right">`.
+    - A `<figcaption>`: "Lead I (LA − RA), 500 samples/s, filtered on the PC: 0.5–150 Hz band-pass and 50 Hz notch. Last 5 s, newest on the right. The scale is in ADC counts, because the module's µV per count is not known. For about 7 s after Connect the trace shows the module's input settling."
+    - The same CSS and focus rule as the PCG page.
+  - **Script:**
+    - Import `createParser`, `createEcgFilter` and `RATE` from `./ecg_dsp.js`.
+    - Show the same messages as the PCG page when Web Serial is missing or the page is not a secure context.
+    - **Connect:**
+      - `requestPort({ filters: [{ usbVendorId: 0x04d8, usbProductId: 0x00df }] })`, open as in Decisions, then `setSignals`.
+      - The button stays disabled until the open settles, because `port` is still null and a second click would start a second connect. A failed attempt closes the port only if this attempt opened it. Both were fixed after the first E3 run and are already in `Web/ecg.html`.
+      - Create a new parser and filter for each connection. Queue the stop sequence, a 100 ms wait, then the start sequence (Decisions, Session), with a one-line why comment.
+      - The wait must sit in the write chain, for example `writes = writes.then(() => new Promise((r) => setTimeout(r, 100)));` between the two `send` calls. A wait outside the chain would put the start's first `01` right after the second `02`, and a Disconnect clicked during it could queue its stop before the start.
+      - The read loop and error handling are the same as the PCG page. Each lead I value goes through the filter into the ring.
+      - Queue the keep-alive whenever `parser.stats.frames` reaches the next multiple of 30 000.
+    - **Disconnect:**
+      - Disable the button, queue the stop sequence, await the chain and then `port.writable.close()`, then set `stopping` and cancel the reader. This drain fix is already in `Web/ecg.html`. A failed drain, for example after an unplug, still goes on to stop.
+      - The loop closes the port and enables the button again, as in the PCG page.
+    - **Status lines:**
+      - Once per second, `#stats` reads "N frames/s, N bytes skipped while syncing, scale ±N counts."
+      - The electrode line is set from `parser.stats` and only rewritten when its text changes.
+  - **README:** a section "ECG viewer (Biomedic ECG module)" that says:
+    - What the page shows and which filters it applies.
+    - Why the scale is in counts.
+    - Where the protocol is described (`Biomedic_ECG_USB_protocol.md` at the repo root).
+    - The test command.
+    - The serve command, plus `/ecg.html`.
+    - "Click Disconnect before closing the tab."
+    - Troubleshooting, one line: if Connect reports "The device has been lost." right away, another tool (pyserial, including the reference script in `Biomedic_ECG_USB_protocol.md` §11) left the port at `min 0`. Run `stty -F /dev/ttyACM0 min 1 time 0`, or replug the module.
+    - A second troubleshooting line, worded like this so the static check finds it: "If Disconnect does not stop the module (it keeps streaming), or Connect shows frames but the module ignores its commands, unplug the module and plug it back in. It is the only known recovery. Then wait until `fuser /dev/ttyACM0` prints nothing before you click Connect." The existing "Click Disconnect before closing the tab" line stays as it is.
+
+  **Acceptance:**
+  - Static checks:
+    ```
+    python3 -c "import re;print(re.search(r'<script type=\"module\">(.*?)</script>',open('Web/ecg.html').read(),re.S).group(1))" > /tmp/ecg_page.mjs && node --check /tmp/ecg_page.mjs && echo page syntax OK
+    python3 -m http.server -b 127.0.0.1 -d Web 8001 >/dev/null 2>&1 & S=$!; sleep 1; for f in ecg.html ecg_dsp.js "" pcg_parser.js; do curl -s -o /dev/null -w "%{http_code} %{content_type} /$f\n" "http://localhost:8001/$f"; done; kill $S
+    git diff --quiet HEAD -- Web/index.html Web/pcg_parser.js Web/pcg_audio.js Tests && echo PCG files unchanged
+    grep -q "stty -F /dev/ttyACM0 min 1 time 0" README.md && echo README troubleshooting OK
+    grep -q "unplug the module and plug it back in" README.md && echo README recovery OK
+    python3 -c "s=open('Web/ecg.html').read(); c=s[s.index('async function connect'):s.index('async function disconnect')]; assert c.index('0x02') < c.index('0x01, 0x09'); print('stop before start OK')"
+    ```
+    The output must be:
+    - `page syntax OK`.
+    - `200 text/html /ecg.html`, `200 text/javascript /ecg_dsp.js`, `200 text/html /` and `200 text/javascript /pcg_parser.js`. Port 8001 avoids the user's server on 8000.
+    - `PCG files unchanged`.
+    - `README troubleshooting OK`.
+    - `README recovery OK`.
+    - `stop before start OK`.
+  - **User check in Chrome.** The agents cannot see the screen. Items 1–5 worked in the second run and are not repeated. Item 1 still says how to open the page.
+    1. From the repo root, run `python3 -m http.server -b 127.0.0.1 -d Projects/WeAct_MiniH750/Applications/USB_Device/PCG_CDC/Web 8000`. Open `http://localhost:8000/ecg.html`. With RA, LA and RL on and sitting still, click Connect (or Tab to it and press Enter). Pick the only port offered: "MCP2200 USB Serial Port Emulator", ttyACM0.
+    2. Within 2 s:
+       - The stats line shows about 500 frames/s (E1's rate).
+       - "Bytes skipped" stays the same from second to second.
+       - The electrode line says RA and LA are on.
+    3. For the first ~7 s a slow swing fills the trace. Then:
+       - The scale settles near ±50–100 counts.
+       - The ECG shows one sharp QRS per heartbeat, about 40 counts tall on the first capture.
+       - The beats match the pulse at the wrist.
+       - The baseline is flat, with no fine 50 Hz fuzz.
+    4. Unclip LA:
+       - Within about 2 s the line says "Lead I not valid: LA electrode off", and the trace jumps.
+       - Clip it back: the line returns to "on", and the ECG returns within about 10 s.
+       - If the line never changes, report it. The flags are then not wired for RA/LA on this unit, and the planner drops the electrode line.
+    5. Leave it running for 3 minutes, past the 60 s and 120 s keep-alives. The trace keeps moving at about 500 frames/s.
+    6. **Clean start and stop with the page as it is now.** Run this right after the replug, before the executioner's change. "Listen" means E1's listen command followed by the `stty` check (Steps, rules).
+       1. Tester: wait 10 s after the replug, then until `fuser /dev/ttyACM0` prints nothing, because ModemManager may probe. If the kernel log names another `ttyACM` for `04d8:00df`, use that name wherever a command says `/dev/ttyACM0`. Then listen. It must print fewer than 1000 bytes: the module is idle after power-up. If it prints about 40 000, stop and report, with no Connect: the page as it is now would send a start to a streaming module.
+       2. User: open the page as in item 1 and Connect. Within 3 s the stats line shows about 500 frames/s. Report whether the slow swing of a fresh start fills the trace. This Connect follows a pyserial command, so it also covers the old item 7 (Chrome after pyserial). After about 10 s, note the bytes-skipped number, then click Disconnect. The status reads "Disconnected."
+       3. Tester: listen. Fewer than 1000 bytes shows that the page's stop works from a clean state, drain fix included.
+    7. **Stop-first Connect.** Run this after the executioner's change and the static checks. The user first reloads the page with Ctrl+Shift+R, so Chrome loads the new `ecg.html`.
+       1. User: Connect. Within 3 s about 500 frames/s. Report whether the swing appears and the bytes skipped after 10 s, then Disconnect.
+       2. Tester: listen. Fewer than 1000 bytes: the stop sent to an idle module did no harm, and the start after it worked.
+       3. User: Connect, wait until frames show, then close the tab without clicking Disconnect.
+       4. Tester: listen. About 40 000 bytes: the module was left streaming, which is the case to test. If it prints fewer than 1000, report it and skip 5–6.
+       5. User: wait 1 minute after closing the tab, because in the incident the module streamed unread for minutes. Open the page in a new tab and Connect. Within 3 s about 500 frames/s. Report whether the swing appears (a sign of a restart) and the bytes skipped after 10 s, then Disconnect.
+       6. Tester: listen. Fewer than 1000 bytes: a Connect after a tab closed without Disconnect stops and restarts the module, and its Disconnect still works.
+
+  - **If a check fails:** follow the line for it and report. Run nothing else that sends to the module.
+    - 6.3 prints about 40 000: the user replugs. The tester waits as in 6.1, runs E1's capture and then the listen, and reports both. If pyserial's stop works, the fault is in the page's stop path. If not, the module goes deaf even on a plain start and stop from idle.
+    - 7.1 shows about 0 frames/s: the module ignored the start that followed the stop. Disconnect. The executioner raises the wait between stop and start from 100 ms to 1000 ms, then the user repeats 7.1 and the tester 7.2. If it shows 0 frames/s again, stop and report.
+    - 7.6 prints about 40 000: the stop-first Connect does not recover a module left streaming. The user replugs. The planner then makes the README tell users to replug after any session that ended without Disconnect.
+    - Any other listen of about 40 000 where fewer than 1000 is expected: the user replugs, and the tester reports the item.
+  - **Result:** E3 passes when:
+    - The static checks print the output above.
+    - Item 6: the listens in 6.1 and 6.3 print fewer than 1000 bytes, and the user saw about 500 frames/s in 6.2.
+    - Item 7: the listens in 7.2 and 7.6 print fewer than 1000 bytes, the one in 7.4 prints about 40 000, and the user saw about 500 frames/s in 7.1, 7.3 and 7.5. If 7.4 prints fewer than 1000, the planner decides.
+    - Every `stty` check prints `min = 1; time = 0`.
+
+## Not doing
+
+- Other leads: II, III and aVR/aVL/aVF need LL, and V1–V6 need chest electrodes.
+- A µV or mV scale.
+- Recording or export.
+- Heart-rate or QRS detection.
+- An ECG paper grid or sweep mode.
+- Filter settings, and zero-phase filtering.
+- Audio.
+- Battery voltage (bytes 36–39 read 0).
+- The vendor's saturation counters, and zeroing lead I when an electrode is off.
+- Auto-reconnect, and sending the stop bytes when the tab closes: Chrome does not run a 100 ms timer in a closing tab, so the next Connect sends the stop instead.
+- Finding which trigger makes the module ignore commands (Decisions): each positive test can cost a replug, and no answer would change the page.
+- The Bluetooth model and the `0x0B` Identify command.
+- Any change to the PCG page, the firmware, CMake, `.vscode` or the guide.
+
+## Needs the user
+
+- **Now:** unplug the ECG module, plug it back in and tell the tester. It is the only known way to make a deaf module obey again. Then do E3 item 6 with the tester.
+- **During E1 and the E3 check:** keep RA, LA and RL on and sit still. Movement shows as large, slow swings.
+- **Before the tester's capture or listen:** click Disconnect on the ECG page. Two programs reading one port each get only part of the bytes.
+- **Before closing the tab:** click Disconnect. Closing the tab skips the stop bytes, so the module keeps streaming.
+  - The earlier note that the next start restarts it was wrong: a start sent to a streaming module came before the module ignored all commands (Decisions).
+  - The stop-first Connect should handle it, and E3 item 7 checks that. Until then, replug the module after a tab closed without Disconnect.
+- **Further replugs may be needed:** E3 items 7.3–7.6 leave the module streaming on purpose. If 7.6 fails, or any other E3 check fails, the module needs another replug (E3, "If a check fails").
+- **If you use pyserial yourself** (including the §11 reference script): set `port.inter_byte_timeout = 0.05` before `open()`, or run `stty -F /dev/ttyACM0 min 1 time 0` afterwards. Otherwise the next Connect in Chrome fails with "The device has been lost." Say if §11 of the protocol doc should get that line: the plan does not edit that file.
+- **After re-plugging the module:** ModemManager probes the port for a few seconds. Wait until `fuser /dev/ttyACM0` prints nothing. Alternatively (needs sudo), add a udev rule with `ENV{ID_MM_DEVICE_IGNORE}="1"` for `04d8:00df`.
+- **Your ECG recordings:** `/tmp/ecg.bin` (from E1) and the earlier scratchpad capture contain your ECG. Delete them when you are done. They are never committed.
+- **Approval needed:** `Biomedic_ECG_USB_protocol.md` is untracked, but `ecg_dsp.js` and the README cite it. It documents a disassembly of the vendor's program. Should it be committed with the page, or kept out?
+- **E3 browser check:** do it and report what you see. The agents cannot see the screen.
+- **Open question:** does the module have an LED or another sign that it is streaming? Users could then spot a stuck module without the tester's listen, and the README could say how.
+- **Open question, µV per count:** the page shows counts until there is a way to calibrate:
+  - A known signal, for example 1 mV from an ECG simulator.
+  - Or the scale factor found in the vendor program (§12, question 1).
+
+  After that, switching to µV is one constant.
+- **Fallback for 50 Hz hum:** if hum shows in another setup while E1's rate is correct, change the notch from Q 30 to Q 10.
+  - At ±0.2 Hz from 50 Hz it attenuates −21 dB instead of −12 dB.
+  - The cost is a dip 5 Hz wide. The ringing after a QRS stays under 0.02 counts in the planner's check.
+
+  It is one number. Say if you want it.
