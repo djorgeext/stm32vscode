@@ -76,7 +76,7 @@ ECG front-end chips ─SPI─▶ microcontroller ─UART 230400─▶ MCP2200 �
 | Port path | `\\.\COMx` |
 | Baud rate | **230400** |
 | Data / parity / stop | **8 / none / 1** |
-| Flow control | none (CTS and DSR handshaking off) |
+| Flow control | CTS and DSR handshaking off; XON/XOFF and abort-on-error aren't set by the program and stay as the driver had them (`0x496F78`) |
 | DTR / RTS | both **disabled** |
 | Driver buffers | 32 KB in, 32 KB out |
 | Read timeout | 10,000 ms total per read call |
@@ -95,7 +95,7 @@ Data is read **one byte at a time**. A failed read or a read that returns nothin
 |---|---|---|
 | `0x01` | Start | Twice at session start, 100 ms apart, clearing the buffers before each |
 | `0x09` | Keep-alive | Once right after start, then twice (5 ms apart) every 30,000 frames (60 s) |
-| `0x02` | Stop | Twice at session end, 100 ms apart |
+| `0x02` | Stop | Twice, 100 ms apart, only when the user stops |
 | `0x0B` | Identify | **Not used over USB.** Only the Bluetooth "Detect" button sends it; the module replies with 7 bytes. |
 
 No other bytes are ever sent to the module. 🔶 The gain setting (`Config/SignalGain`) doesn't seem to be sent to the device, so it's probably applied in software only.
@@ -120,6 +120,8 @@ PC                                         Module
 │  ── 0x02 ── wait 100 ms ── 0x02 ────────▶
 │  close port
 ```
+
+✅ After a read error or the 10 s timeout, the program closes the port without the stop (`0x495227`), so the module can keep streaming until the next start.
 
 🔶 Whether the module actually stops streaming without the keep-alive hasn't been tested.
 
@@ -292,6 +294,7 @@ def decode(f):
 def acquire(device="/dev/ttyACM0", seconds=10):
     port = serial.Serial()
     port.port, port.baudrate, port.timeout = device, 230400, 10
+    port.inter_byte_timeout = 0.05  # without it pyserial leaves the tty at VMIN 0 and Chrome Web Serial then fails with "The device has been lost"; the other fix is stty -F /dev/ttyACM0 min 1 time 0
     port.dtr = port.rts = False  # the Windows program disables both
     port.open()
     try:
@@ -324,7 +327,7 @@ if __name__ == "__main__":
 
 ### 12.1 Resting-ECG filter chain
 
-✅ Used by the live monitor (`EcgMonitorWindow`), the review screen (`EcgReviewWindow`) and the printed report. Stages run in this order (values for 500 Hz, the device's rate):
+✅ Used by the live monitor (`EcgMonitorWindow`), the review screen (`EcgReviewWindow`) and the printed report. The chain is built over a record of known length (the trend's first and last 3 s are set at build time, `0x466C43`, `0x46FE70`), processed in 4096-sample blocks (`0x447034`, `0x461C46`), and rebuilt by the monitor's filter buttons (`0x43CE90`–`0x43CEC1`). 🔶 How the monitor filters while it's still acquiring wasn't traced. Stages run in this order (values for 500 Hz, the device's rate):
 
 | # | Stage | When it runs | What it is | Actual response |
 |---|---|---|---|---|
@@ -339,7 +342,8 @@ How the stages are applied:
 - ✅ **Standard designs:** stages 1 and 4 match SciPy `butter(2, 0.25, 'high', fs=500)` and `butter(4, 0.75, 'high', fs=500)` to at least 6 decimals. The notch is a custom design (zeros at ≈49.97 Hz and ≈99.99 Hz, pole radius 0.975).
 - ✅ **Zero phase:** the IIR stages (1, 2, 4) run forward and then backward over the data, like SciPy `filtfilt`. This cancels their phase shift but squares their magnitude response; the cutoffs in the table already include that. The program implements them as `y[n] = Σ b[k]·x[n−k] − Σ a[k]·y[n−k]`.
 - ✅ **Settling margin:** to avoid edge transients, each IIR stage also filters samples borrowed from the neighbouring data blocks: 2000 samples (4 s) for stage 1, 500 (1 s) for the notch, 3000 (6 s) for the baseline filter.
-- ✅ **FIR stage:** single pass, symmetric taps, re-centred by taps/2, so there is no time shift (the even-length 12-tap filter is off by half a sample, 1 ms). The output is truncated and clamped to 16 bits.
+- ✅ **FIR stage:** single pass, symmetric taps, re-centred by taps/2, so there is no time shift (the even-length 12-tap filter is off by half a sample, 1 ms).
+- ✅ **16-bit output:** the output of the IIR and FIR stages is truncated and clamped to 16 bits (`0x472C7F`–`0x472CB7` for the IIR stages).
 - ✅ **Defaults:** notch `50hz`, low-pass `40hz`. A notch setting other than `50hz` (e.g. `60hz`) throws the error *"pendiente - filtro no definido"* ("pending – filter not defined"): **the 60 Hz notch is not implemented** in this chain. 🔶 No interface text that changes either default was found, so 25 Hz and 60 Hz are probably unreachable from the interface.
 - 🔶 **Filters are re-applied, not stored:** the study file saves only three on/off flags under `ecgFilters` (`notch 50hz`, `muscle noise`, `baseline fix`). The stored signal is therefore probably unfiltered, with the filters re-applied whenever it's displayed or printed.
 
@@ -373,7 +377,7 @@ h25 = [-0.00689843760973636, -0.00246292660156455, 0.00342437007210368, 0.015942
        0.00342437007210368, -0.00246292660156455, -0.00689843760973636]
 ```
 
-🔶 Approximate offline equivalent with SciPy, for an `ecg` array of shape `(samples, channels)` at 500 Hz. It ignores the block-boundary handling and the 16-bit rounding between stages:
+🔶 Approximate offline equivalent with SciPy, for an `ecg` array of shape `(samples, channels)` at 500 Hz. It ignores the block-boundary handling and the 16-bit rounding between stages. It also differs at the edges: it pads with `filtfilt`'s odd extension and uses `mode="nearest"` for the FIR, while the program starts each pass from zero state, reads zeros beyond the data, and starts the backward pass `margin` samples after the end (`0x472838`, `0x472E5D`):
 
 ```python
 import numpy as np
@@ -458,7 +462,7 @@ Filtering (§12):
 | `0x509B28`–`0x509FD0` | Low-pass FIR tables (250 / 500 / 1000 Hz) |
 | `0x467890` | Stress-test FIR/FFT chain; tables `0x506FB8`–`0x509B28` and `0x509FD0`–`0x50E5C0`+1501 taps |
 
-A second, nearly identical acquisition thread class (vtable `0x518AD0`, run loop around `0x495E20`) uses the same commands, frame layout and electrode mapping.
+A second, nearly identical acquisition thread class (vtable `0x518AD0`, run loop around `0x495E20`) is the "HRProtocol" variant. It's chosen only when the setting `Config/HRProtocol` is true (default false, `0x40701F`, `0x407123`, `0x407253`). Its commands and timings are the same, but it opens at 570,000 baud (`0x4958FA`, `0x407150`), sends the keep-alive every 60,000 frames (`0x495F08`, `0x496D94`), and its blocks start with `C0` only, with no `01`/`02`/`03` markers (`0x495F56`).
 
 The program also contains drivers for a treadmill (Kipnet; ASCII commands such as `;0GO00:`) and an ergometer, for the stress-test version. They aren't related to the ECG module.
 

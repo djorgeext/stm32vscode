@@ -125,7 +125,9 @@ Raw (unfiltered) stream, decimation (all 48 kHz filtered samples go on the wire)
 
 The old E3 items 6–7 are superseded by E4.
 
-**E7 (2026-11-03), at the user's request "I want you to show me both leads I and II":** the page draws lead II as well. Until E7 is done, the page heading still reads "ECG viewer (lead I)" and shows lead I only. E7 renames it, and this plan's title and Goal already say "leads I and II". Lead II needs a fourth electrode, LL, which the user has not worn so far.
+**E7 (2026-11-03), at the user's request "I want you to show me both leads I and II":** the page draws lead II as well, under the heading "ECG viewer (leads I and II)". E7 passed with the LL electrode on. E1–E7 are committed in `539c1e6`.
+
+**D1 (2026-11-03), at the user's request "yes, correct the document and add the §11 line":** the five findings below are corrected in `Biomedic_ECG_USB_protocol.md`, and its §11 example gets the `inter_byte_timeout` line.
 
 ## Findings from the installer (2026-11-03)
 
@@ -180,7 +182,7 @@ The old E3 items 6–7 are superseded by E4.
   - Linux `cdc_acm` raises DTR and RTS on every open and drops them on close. That covers Chrome, pyserial, `stty -F`, and ModemManager if it probes. The page then lowers them with `setSignals`. The MCP2200 has no DTR pin, and its RTS pin works only with hardware flow control, so this is probably harmless.
   - ModemManager, if it probes after a plug-in, is the only other program that sends bytes to the module (AT commands). E4.1 checks its log without sending anything.
 
-### Where the user's document is contradicted or incomplete (the plan does not edit it)
+### Where the user's document is contradicted or incomplete (corrected in D1)
 
 - Appendix A says the second acquisition thread "uses the same commands, frame layout…". The commands and timings are the same. The baud rate (570 000), the keep-alive interval (60 000 frames) and the block markers (`C0` only) differ (above).
 - §5 "Flow control: none": the program clears only CTS/DSR handshaking and DTR/RTS control. XON/XOFF and `fAbortOnError` are inherited from the driver (`0x496F78`).
@@ -715,15 +717,78 @@ EOF
   - The user accepts both traces.
   - If the user cannot attach LL, items 1–4 cannot pass. The user then confirms only the "LL missing" picture and that lead I is unchanged, and E7 stays open.
 
+- [x] D1. **Correct `Biomedic_ECG_USB_protocol.md` and add the §11 line (document only, no device).**
+  **Result (2026-11-03), executioner:** the five findings and the §11 line are in place in §5, §6, §7, §11, §12.1, §12.2 and Appendix A; check 2 printed all four lines. Tester (2026-11-03): checks 1–3 pass; only the two files modified, the script printed all four lines, the word diff shows changes only in the D1 sections. Then the 16-bit bullet was narrowed to the IIR and FIR stages, as stage 0 was not checked.
+  The user asked on 2026-11-03: "yes, correct the document and add the §11 line." This lifts "the plan does not edit the document" for D1 only.
+
+  **Executioner.** Edit only `Biomedic_ECG_USB_protocol.md` (repo root), plus D1's tick and result line here. The facts are in Findings, "Where the user's document is contradicted or incomplete", and are already verified: do not re-check them, and never run the installer or anything from it.
+  - **Style:** correct the wrong sentence where it stands. No errata section, no new headings, no reflowed paragraphs. Keep the document's ✅/🔶 markers, its thousands commas (`570,000`), its contractions and its backticked addresses.
+  - **§5:** the "Flow control" row says CTS and DSR handshaking are off, and that XON/XOFF and abort-on-error are not set by the program and stay as the driver had them (`0x496F78`).
+  - **§6 and §7:** the Stop row says the stop is sent only when the user stops. Below the §7 diagram, one ✅ line: after a read error or the 10 s timeout, the program closes the port without the stop (`0x495227`), so the module can keep streaming until the next start.
+  - **§12.1:**
+    - In the "Used by the live monitor" sentence, say that the chain is built over a record of known length (the trend's first and last 3 s are set at build time, `0x466C43`, `0x46FE70`), processed in 4096-sample blocks (`0x447034`, `0x461C46`), and rebuilt by the monitor's filter buttons (`0x43CE90`–`0x43CEC1`). Add a 🔶: how the monitor filters while it is still acquiring wasn't traced.
+    - The "truncated and clamped to 16 bits" fact moves from the FIR bullet so that it covers the IIR stages too (`0x472C7F`–`0x472CB7`).
+  - **§12.2:** extend the sentence before the SciPy sketch. The sketch pads with `filtfilt`'s odd extension and uses `mode="nearest"`, while the program starts each pass from zero state, reads zeros beyond the data, and starts the backward pass `margin` samples after the end (`0x472838`, `0x472E5D`). Neither code block changes.
+  - **§11:** one line in `acquire()`, after the `port.port, … = …` line and before `port.open()`: `port.inter_byte_timeout = 0.05`, with a one-line comment (on the same line, or one `#` line directly above). The comment says that without it pyserial leaves the tty at VMIN 0 and Chrome Web Serial then fails with "The device has been lost", and that the other fix is `stty -F /dev/ttyACM0 min 1 time 0`. Use these exact strings: `VMIN 0`, `The device has been lost`, `stty -F /dev/ttyACM0 min 1 time 0`. Nothing else in the block changes.
+  - **Appendix A, the "second, nearly identical acquisition thread class" sentence:** keep the vtable and run-loop addresses. Say that it is chosen only when the setting `Config/HRProtocol` is true (default false, `0x40701F`, `0x407123`, `0x407253`). Its commands and timings are the same, but it opens at 570,000 baud (`0x4958FA`, `0x407150`), sends the keep-alive every 60,000 frames (`0x495F08`, `0x496D94`), and its blocks start with `C0` only, with no `01`/`02`/`03` markers (`0x495F56`). The phrase "uses the same commands, frame layout" goes. The tables stay as they are.
+  - Do not commit.
+
+  **Tester (repo root, no device):**
+  1. `git status --porcelain` prints exactly ` M Biomedic_ECG_USB_protocol.md` and ` M PLAN.md`, and `git diff --stat` lists only those two files.
+  2. This check compares the document with `HEAD`. It must print its four lines.
+
+```
+python3 -I - <<'EOF'
+import ast, re, subprocess
+F = "Biomedic_ECG_USB_protocol.md"
+old = subprocess.run(["git", "show", "HEAD:" + F], capture_output=True, text=True, check=True).stdout
+new = open(F, encoding="utf-8").read()
+def sections(t):
+    order, out, head, fence = [], {}, "", False
+    for line in t.splitlines():
+        if line.startswith("```"): fence = not fence
+        if not fence and re.match(r"#{1,3} ", line): head = line; order.append(line)
+        out.setdefault(head, []).append(line)
+    return order, {k: "\n".join(v) for k, v in out.items()}
+oh, o = sections(old); nh, n = sections(new)
+assert oh == nh, "headings changed"
+H = {k: next(h for h in nh if h.startswith(k)) for k in ["## 5.", "## 6.", "## 7.", "## 11.", "### 12.1", "### 12.2", "## Appendix A"]}
+for h in n:
+    assert h in H.values() or o[h] == n[h], "changed outside D1: " + h
+print("only D1 sections changed")
+code = lambda t: re.findall(r"```.*?```", t, re.S)
+assert code(o[H["### 12.2"]]) == code(n[H["### 12.2"]]), "12.2 code changed"
+row = lambda t: [l for l in t.splitlines() if l.startswith("|")]
+assert row(o[H["## Appendix A"]]) == row(n[H["## Appendix A"]]), "Appendix A tables changed"
+print("12.2 code and Appendix A tables unchanged")
+def has(k, *subs):
+    for s in subs: assert s in n[H[k]], f"{k} lacks {s!r}"
+has("## 5.", "XON/XOFF", "0x496F78")
+assert "0x495227" in n[H["## 6."]] + n[H["## 7."]], "6/7: no stop after a read error missing"
+has("### 12.1", "0x466C43", "0x46FE70", "4096", "0x447034", "0x461C46", "0x43CE90", "traced", "0x472C7F")
+has("### 12.2", "zero state", "0x472838", "0x472E5D")
+has("## Appendix A", "570,000", "60,000", "0x495F56", "HRProtocol")
+assert "uses the same commands, frame layout" not in n[H["## Appendix A"]]
+print("five findings present")
+o11, n11 = (re.search(r"```python\n(.*?)```", t[H["## 11."]], re.S).group(1) for t in (o, n))
+ast.parse(n11)
+added = [l for l in n11.splitlines() if "inter_byte_timeout" in l or l.strip().startswith("#")]
+assert [l for l in n11.splitlines() if l not in added] == o11.splitlines() and 1 <= len(added) <= 2, "11: other code changed"
+assert "port.inter_byte_timeout = 0.05" in n11 and n11.index("inter_byte_timeout") < n11.index("port.open()")
+assert "VMIN 0" in n11 and "The device has been lost" in n11 and "stty -F /dev/ttyACM0 min 1 time 0" in n11
+print("11 parses, only the inter_byte_timeout line added")
+EOF
+```
+
+  3. Read `git diff --word-diff -- Biomedic_ECG_USB_protocol.md`. Every change is one of the edits above, in its own section, and the rest of each sentence keeps the user's wording.
+
+  **D1 passes when** 1 holds, 2 prints `only D1 sections changed`, `12.2 code and Appendix A tables unchanged`, `five findings present` and `11 parses, only the inter_byte_timeout line added`, and 3 finds no other change. The planner dry-ran 2: on the unedited document it stops at `## 5. lacks 'XON/XOFF'`, and on a simulated correct edit it prints all four lines.
+
 ## Next, in order
 
-1. **Main session:** tick E6 once the user answers about the noise. `PLAN.md` also still shows E5 as `- [ ]`, though E5 passed: tick it too. E7 does not wait for either.
-2. **Tester:** save the pre-E7 files (E7, first block). Nothing else yet.
-3. **Executioner:** E7's changes to `Web/ecg_dsp.js`, `Web/ecg.html`, `Tests/ecg_dsp_test.mjs` and `README.md`, nothing else. Do not touch the device.
-4. **Tester:** E7's node tests and static checks. Report every printed line.
-5. **User, with the tester:** attach the LL electrode, hard-reload, then do E7 items 1–6 on the module. Report both scales, the R-peak heights, and what lead II did when LL was unclipped. The tester runs the listen in item 6.
-
-If E6 fails (the user is not satisfied with the noise), the planner revises the filter in `createEcgFilter()` only, and the revision then applies to both leads.
+1. **Executioner:** D1's edits to `Biomedic_ECG_USB_protocol.md`, nothing else. Do not commit.
+2. **Tester:** D1's checks 1–3. Report every printed line.
+3. **Main session:** tick D1 with its result line, then ask the user whether to commit.
 
 ## Not doing
 
@@ -752,32 +817,28 @@ If E6 fails (the user is not satisfied with the noise), the planner revises the 
   - Zeroing lead I or II when an electrode is off.
   - A shared or switchable scale for the two traces (E7 decides per lead, see Decisions).
   - Auto-reconnect, and sending the stop when the tab closes (Chrome does not run a 100 ms timer in a closing tab).
+- **Document (D1):** other stale notes in `Biomedic_ECG_USB_protocol.md`, such as "Not tested with real hardware" in §10 and "not against a real device" in §11, and §13's open questions, stay as written (not asked).
 - **Out of scope:** any change to the PCG page, the firmware, CMake, `.vscode` or the guide.
 
 ## Needs the user
 
-- **Now:** answer E6.2 (is the reduced noise satisfactory?), if you have not yet.
-- **For E7, attach the LL electrode:** a fresh gel electrode on your left leg (left ankle, or lower left abdomen), with the clip labelled LL, in addition to RA, LA and RL.
-  - Without it, lead II cannot show an ECG. The module reports LL off, the page says "Lead II not valid: LL electrode off.", and lead II shows no heartbeat (E7, "What lead II looks like when LL is missing").
-  - During E7 you unclip LL, LA and RA one at a time, and clip each back on.
-- **E7, open question:** each trace has its own scale, so lead I stays readable when lead II is at the rail. If you would rather have one shared scale once LL is on, so that heights compare at a glance, say so.
-- **During E4, E6 and E7:**
-  - Keep RA, LA and RL on (and LL in E7) and sit still.
-  - Click Disconnect before closing the tab, except in E4 item 5, where closing without it is the test.
-  - Two programs reading one port each get only part of the bytes, so no page may be connected while the tester listens.
+- **During any session with the module:**
+  - Keep RA, LA, LL and RL on and sit still.
+  - Click Disconnect before closing the tab.
+  - Two programs reading one port each get only part of the bytes, so no page may be connected while someone listens.
 - **Replugs:** E4.5 leaves the module streaming on purpose, and any failed check may need a replug (E4, "If a check fails"). After every plug-in, wait until `fuser /dev/ttyACM0` prints nothing, because ModemManager may probe.
   - The alternative needs sudo: a udev rule with `ENV{ID_MM_DEVICE_IGNORE}="1"` for `04d8:00df`.
   - If E4.1's journal shows ModemManager probing the module, the planner recommends that rule.
 - **Answered 2026-11-03, filters:** all of the vendor's filters are always on, and they run forward only, with no delay (Decisions). You accepted that T waves and ST segments then differ from the vendor's program.
   - For your information: the 0.75 Hz baseline filter is above the 0.67 Hz limit often cited from the AHA 2007 recommendations, and that limit is meant for zero-phase filters. For forward-only filters the same recommendations are usually cited at 0.05 Hz.
   - So this trace is for watching rhythm and QRS live, not for judging ST segments.
-- **Your document (`Biomedic_ECG_USB_protocol.md`):** the "contradicted or incomplete" list in Findings has five points (Appendix A, §5, §6/§7, §12.1 and §12.2). The plan does not edit the document. Say if you want them corrected, and if §11's example should get the `inter_byte_timeout` line.
+- **Your document (`Biomedic_ECG_USB_protocol.md`), decided 2026-11-03:** you asked for the five points in Findings (Appendix A, §5, §6/§7, §12.1 and §12.2) to be corrected and for §11's `inter_byte_timeout` line. D1 does both. After D1, say whether to commit it.
 - **Optional diagnostic, if the module goes deaf again (H4):**
   - A read-only query of the MCP2200's configuration through its HID interface (`/dev/hidraw*`) would show whether hardware flow control is set in its EEPROM.
   - It sends a "read all" HID report. It writes no settings, but it is still traffic to the bridge, it needs sudo or a udev rule for `hidraw`, and the report layout must first be checked against Microchip's MCP2200 datasheet.
   - Say if you approve it. Until then, no agent touches the HID interface.
 - **For your information, no action needed:**
-  - `Biomedic_ECG_USB_protocol.md` is already committed (`8c56a39`). Your §12 edit is not committed yet.
+  - `Biomedic_ECG_USB_protocol.md`, with your §12 edit, is committed (`8c56a39`, `539c1e6`).
   - `BiomedicECG-Setup.exe` is already ignored by `.gitignore` (`*.exe`), so it cannot be committed by accident.
 - **Your recordings:** `/tmp/ecg.bin` is gone. Earlier scratchpad captures from the 2026-10-30 session may still hold your ECG: delete them when you are done.
 - **Open questions, kept:**

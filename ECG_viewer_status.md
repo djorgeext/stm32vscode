@@ -32,6 +32,5 @@ Then open http://localhost:8001/ecg.html. Port 8000 is used by `strategy_app.py`
 ## Open
 
 - Committed on 2026-11-03, with `Acquisition_systems_summary.md`.
-- `PLAN.md` lists five places where `Biomedic_ECG_USB_protocol.md` is wrong or incomplete: Appendix A, §5, §6/§7, §12.1 and §12.2. The document has not been edited.
-- Optional: add the `inter_byte_timeout` line to the §11 Python example.
+- `Biomedic_ECG_USB_protocol.md` was corrected on 2026-11-03 (`PLAN.md` step D1): §5, §6, §7, §11 (`inter_byte_timeout` line), §12.1, §12.2 and Appendix A. Not committed yet.
 - Reminder: the PCG page (`Web/index.html`) has the double-Connect bug. Fix it the same way as `ecg.html` the next time you work on PCG.
