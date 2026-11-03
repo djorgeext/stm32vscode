@@ -1,8 +1,8 @@
-# Biomedic ECG: USB Communication Protocol
+# Biomedic ECG: USB Communication Protocol and Signal Filtering
 
-Reverse-engineered from the Windows software on the installation CD. Analysis date: 2026-10-30.
+Reverse-engineered from the Windows software on the installation CD. Analysis dates: 2026-10-30 (USB protocol), 2026-11-02 (filtering, §12).
 
-**Scope:** how the PC software (`BiomedicECG.exe`) talks to the **USB model** of the Biomedic ECG acquisition module. The Bluetooth model uses the same frames over a Bluetooth serial port and isn't covered here.
+**Scope:** how the PC software (`BiomedicECG.exe`) talks to the **USB model** of the Biomedic ECG acquisition module, and how it then filters the signal. The Bluetooth model uses the same frames over a Bluetooth serial port and isn't covered here.
 
 **How this was obtained:** static analysis only. The installer was unpacked and the program was disassembled; nothing was run, and no real device was connected. Every statement is marked as one of:
 
@@ -19,6 +19,7 @@ Reverse-engineered from the Windows software on the installation CD. Analysis da
 - ✅ The PC sends three one-byte commands: `0x01` (start), `0x09` (keep-alive), `0x02` (stop).
 - ✅ The module sends one **40-byte frame per sample at 500 samples/s** (20,000 bytes/s). Each frame holds 12 measured channels as signed 16-bit big-endian values, electrode-off flags and a battery byte.
 - ✅ The module measures I, II, III, V1–V6 (plus 3 auxiliary channels). The software calculates aVR, aVL and aVF.
+- ✅ All filtering is done on the PC (§12): trend removal and a 0.25 Hz high-pass are always on; a 50 Hz notch, a 40 Hz low-pass and a 0.75 Hz baseline filter are switched on by buttons.
 
 ---
 
@@ -317,7 +318,99 @@ if __name__ == "__main__":
 
 ---
 
-## 12. Open questions
+## 12. Signal filtering (PC software)
+
+✅ The module sends unfiltered samples; all filtering happens in `BiomedicECG.exe`. Every filter below was rebuilt from the coefficients stored in the program, and its response was computed with SciPy. The cutoffs are therefore measured from the coefficients, not taken from labels.
+
+### 12.1 Resting-ECG filter chain
+
+✅ Used by the live monitor (`EcgMonitorWindow`), the review screen (`EcgReviewWindow`) and the printed report. Stages run in this order (values for 500 Hz, the device's rate):
+
+| # | Stage | When it runs | What it is | Actual response |
+|---|---|---|---|---|
+| 0 | Trend removal | Always | Per channel: subtracts a straight line from the mean of the first 3 s to the mean of the last 3 s of the record | Removes offset and slow drift |
+| 1 | Permanent high-pass | Always | 2nd-order Butterworth, 0.25 Hz | −3 dB at **0.31 Hz** |
+| 2 | **NF** (line notch) | Button | 4th-order IIR with notches at **50 Hz and 100 Hz** | ≈ −70 dB at 50 Hz; −3 dB band 46.9–53.2 Hz |
+| 3 | **MF** (muscle noise) | Button | FIR low-pass: **40 Hz** (12 taps, default) or 25 Hz (19 taps) | 40 Hz version: −3 dB at 39.5 Hz, only −5 dB at 50 Hz. 25 Hz version: −3 dB at 24.7 Hz |
+| 4 | **HF** (baseline) | Button | 4th-order Butterworth high-pass, 0.75 Hz | −3 dB at **0.84 Hz** |
+
+How the stages are applied:
+
+- ✅ **Standard designs:** stages 1 and 4 match SciPy `butter(2, 0.25, 'high', fs=500)` and `butter(4, 0.75, 'high', fs=500)` to at least 6 decimals. The notch is a custom design (zeros at ≈49.97 Hz and ≈99.99 Hz, pole radius 0.975).
+- ✅ **Zero phase:** the IIR stages (1, 2, 4) run forward and then backward over the data, like SciPy `filtfilt`. This cancels their phase shift but squares their magnitude response; the cutoffs in the table already include that. The program implements them as `y[n] = Σ b[k]·x[n−k] − Σ a[k]·y[n−k]`.
+- ✅ **Settling margin:** to avoid edge transients, each IIR stage also filters samples borrowed from the neighbouring data blocks: 2000 samples (4 s) for stage 1, 500 (1 s) for the notch, 3000 (6 s) for the baseline filter.
+- ✅ **FIR stage:** single pass, symmetric taps, re-centred by taps/2, so there is no time shift (the even-length 12-tap filter is off by half a sample, 1 ms). The output is truncated and clamped to 16 bits.
+- ✅ **Defaults:** notch `50hz`, low-pass `40hz`. A notch setting other than `50hz` (e.g. `60hz`) throws the error *"pendiente - filtro no definido"* ("pending – filter not defined"): **the 60 Hz notch is not implemented** in this chain. 🔶 No interface text that changes either default was found, so 25 Hz and 60 Hz are probably unreachable from the interface.
+- 🔶 **Filters are re-applied, not stored:** the study file saves only three on/off flags under `ecgFilters` (`notch 50hz`, `muscle noise`, `baseline fix`). The stored signal is therefore probably unfiltered, with the filters re-applied whenever it's displayed or printed.
+
+### 12.2 Coefficients (500 Hz)
+
+IIR stages, standard form `a[0] = 1`. In the program the feedback terms are stored with the opposite sign, and `a[0]` is ignored.
+
+```python
+# Stage 1: permanent high-pass, Butterworth order 2, 0.25 Hz
+b1 = [0.997781024102941, -1.99556204820588, 0.997781024102941]
+a1 = [1, -1.99555712434579, 0.995566972065975]
+
+# Stage 2: NF notch, 50 Hz + 100 Hz
+b2 = [0.951558090821252, -2.1284207536999, 2.85527558178394, -2.1284207536999, 0.951558090821252]
+a2 = [1, -2.18192506761969, 2.85407296314357, -2.07491643978012, 0.904318800282871]
+
+# Stage 4: HF baseline, Butterworth order 4, 0.75 Hz
+b4 = [0.987761389276826, -3.9510455571073, 5.92656833566095, -3.9510455571073, 0.987761389276826]
+a4 = [1, -3.97537191256092, 5.92641855596542, -3.92671919775679, 0.975672562146085]
+
+# Stage 3: MF low-pass FIR, "40hz" (12 taps, default)
+h40 = [-0.00812031626499363, 0.00279430037155961, 0.0363062486230826, 0.0960723789024121,
+       0.163761187856556, 0.209186200511384, 0.209186200511384, 0.163761187856556,
+       0.0960723789024121, 0.0363062486230826, 0.00279430037155961, -0.00812031626499363]
+
+# Stage 3: MF low-pass FIR, "25hz" (19 taps)
+h25 = [-0.00689843760973636, -0.00246292660156455, 0.00342437007210368, 0.0159428667892704,
+       0.0354180533171441, 0.060307062743425, 0.0871989329020898, 0.111461378354002,
+       0.128381833793646, 0.134453732479239, 0.128381833793646, 0.111461378354002,
+       0.0871989329020898, 0.060307062743425, 0.0354180533171441, 0.0159428667892704,
+       0.00342437007210368, -0.00246292660156455, -0.00689843760973636]
+```
+
+🔶 Approximate offline equivalent with SciPy, for an `ecg` array of shape `(samples, channels)` at 500 Hz. It ignores the block-boundary handling and the 16-bit rounding between stages:
+
+```python
+import numpy as np
+from scipy import ndimage, signal
+
+def biomedic_filter(ecg, nf=False, mf=False, hf=False, fs=500):
+    x = ecg.astype(float)
+    n, t = int(3 * fs + 0.5), np.arange(len(x))[:, None]
+    m0, m1 = x[:n].mean(axis=0), x[-n:].mean(axis=0)
+    x -= m0 + (m1 - m0) * (t - n // 2) / (len(x) - n)          # stage 0: line through the 3 s end means
+    x = signal.filtfilt(b1, a1, x, axis=0)                     # stage 1 (always)
+    if nf: x = signal.filtfilt(b2, a2, x, axis=0)              # stage 2: 50 + 100 Hz notch
+    if mf: x = ndimage.convolve1d(x, h40, axis=0, mode="nearest")  # stage 3: centred FIR
+    if hf: x = signal.filtfilt(b4, a4, x, axis=0)              # stage 4: 0.75 Hz baseline
+    return x
+```
+
+### 12.3 Observations
+
+- **Low-frequency cutoff:** the manual says 0.05–120 Hz, but the always-on stage 1 makes the effective lower limit **0.31 Hz** (0.84 Hz with the baseline filter on).
+- **Baseline filter vs. guidelines:** 0.84 Hz is above the 0.67 Hz commonly cited from the AHA 2007 recommendations as the maximum for zero-phase baseline filters, so it can affect ST segments.
+- **The 40 Hz muscle filter is gentle:** it reduces 50 Hz by only about 5 dB, so mains interference really depends on the notch.
+- **Other sampling rates:** the program also has tables for 250 and 1000 Hz, which this device doesn't use. At 250 Hz the notch is silently skipped. At 1000 Hz the baseline filter has a pole exactly on the unit circle, cancelled by a zero, so it is numerically fragile.
+
+### 12.4 Second chain (stress test only)
+
+✅ The stress-test analysis code (ST trends per stage) uses a separate chain built only from long FIR filters (500 Hz values):
+
+- an always-on 1501-tap high-pass (−3 dB at 0.42 Hz);
+- 195-tap notches, which **do** include 60 Hz (−60 dB at 50 or 60 Hz; −3 dB band ±3 Hz);
+- a 501-tap baseline filter (−3 dB at 1.3 Hz), or an FFT option that processes 1024-sample blocks and zeroes the lowest frequency bins.
+
+It doesn't affect resting ECGs. 🔶 Only the 500 Hz tables were checked in detail; two of the 250/1000 Hz baseline tables don't come out clean (one isn't symmetric, the other doesn't sum to zero), so their exact lengths may be slightly off.
+
+---
+
+## 13. Open questions
 
 1. **Amplitude scale:** how many µV one count represents. The program's display code would answer it; alternatively, record a known calibration signal.
 2. **Bytes 37–39** of the frame: never read by the program.
@@ -325,6 +418,8 @@ if __name__ == "__main__":
 4. **Whether the keep-alive is required:** does the module stop after ~60 s without `0x09`?
 5. **Exact firmware meaning** of `0x01`, `0x09` and `0x02`. For example, `0x01` could be "reset" and `0x09` "start streaming".
 6. **Manual vs. code:** the manual's "8-bit resolution" contradicts the 16-bit samples.
+7. **Filter settings:** whether any screen or configuration file can switch the notch to 60 Hz (which would trigger the "filtro no definido" error) or the low-pass to 25 Hz.
+8. **Stored data:** confirm that study files contain the unfiltered signal (§12.1).
 
 ---
 
@@ -347,6 +442,21 @@ if __name__ == "__main__":
 | `0x518A38` / `0x518A48` | Strings `BIOMEDIC ECG` / `BIOMEDIC ERGO` |
 | `0x518AC0` | `double 0.013` (battery scale) |
 | `0x4E6D74`… | Electrode names `LL`, `LA`, `RA`, `V1`…`V6` |
+
+Filtering (§12):
+
+| Address | What it is |
+|---|---|
+| `0x4664E0` | Resting-ECG filter object constructor (defaults `50hz`, `40hz`) |
+| `0x466BF0` | Builds the resting-ECG chain from the NF / MF / HF flags |
+| `0x472440` | Trend-removal stage (curve through 3 points, subtracted per sample) |
+| `0x472650` / `0x472760` | IIR filter constructor / processing (forward + backward passes) |
+| `0x472CE0` / `0x472DA0` | FIR filter constructor / processing (centred, 16-bit output) |
+| `0x470070` | Seconds → samples (`fs × s + 0.5`) |
+| `0x506C60` | Error string `pendiente - filtro no definido` |
+| `0x506CA0`–`0x506DF8` | IIR coefficients |
+| `0x509B28`–`0x509FD0` | Low-pass FIR tables (250 / 500 / 1000 Hz) |
+| `0x467890` | Stress-test FIR/FFT chain; tables `0x506FB8`–`0x509B28` and `0x509FD0`–`0x50E5C0`+1501 taps |
 
 A second, nearly identical acquisition thread class (vtable `0x518AD0`, run loop around `0x495E20`) uses the same commands, frame layout and electrode mapping.
 

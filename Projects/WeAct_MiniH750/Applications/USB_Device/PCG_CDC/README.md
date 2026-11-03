@@ -49,10 +49,14 @@ python3 -m http.server -b 127.0.0.1 -d Projects/WeAct_MiniH750/Applications/USB_
 ## ECG viewer (Biomedic ECG module)
 
 `Web/ecg.html` reads the Biomedic ECG module's USB serial port (MCP2200, VID:PID `04d8:00df`, 230400 baud) with
-Web Serial and draws lead I (LA − RA) for the last 5 s at 500 samples/s. It also shows the frame rate, the bytes
-skipped while syncing and whether the RA and LA electrodes are on. `Web/ecg_dsp.js` filters on the PC: a 0.5–150 Hz
-band-pass (2nd-order Butterworth high-pass and low-pass) and a 50 Hz notch (Q 30). The first ~7 s after Connect
-show the module's input settling. The scale is in ADC counts, because the module's µV per count is not known.
+Web Serial and draws leads I (LA − RA) and II (LL − RA) for the last 5 s at 500 samples/s, one trace each with its
+own scale. It also shows the frame rate, the bytes skipped while syncing and whether the RA, LA and LL electrodes
+are on. Lead II needs the LL electrode (left leg): without it the module reports LL off, the page says "Lead II not
+valid: LL electrode off." and the lead II trace shows no heartbeat. `Web/ecg_dsp.js` filters on the PC with the vendor
+program's resting-ECG filters (protocol §12), always on: a 0.25 Hz Butterworth high-pass, a 50 + 100 Hz notch, a 40 Hz
+FIR low-pass and a 0.75 Hz baseline filter. They run forward only, one sample at a time, so the trace has no delay.
+Unlike the vendor's zero-phase filtering, this shifts slow waves, so T waves and ST segments differ from the vendor's
+program. The first ~2 s after Connect show the module's input settling. The scale is in ADC counts, because the module's µV per count is not known.
 The protocol is described in `Biomedic_ECG_USB_protocol.md` at the repo root. From this folder, check the parser and the filters:
 
 ```
@@ -68,6 +72,8 @@ python3 -m http.server -b 127.0.0.1 -d Projects/WeAct_MiniH750/Applications/USB_
 Click Disconnect before closing the tab: it sends the module's stop command, and closing the tab does not.
 
 Troubleshooting: if Connect reports "The device has been lost." right away, another tool (pyserial, including the reference script in `Biomedic_ECG_USB_protocol.md` §11) left the port at `min 0`. Run `stty -F /dev/ttyACM0 min 1 time 0`, or replug the module.
+
+If Disconnect does not stop the module (it keeps streaming), or Connect shows frames but the module ignores its commands, unplug the module and plug it back in. It is the only known recovery. Then wait until `fuser /dev/ttyACM0` prints nothing before you click Connect.
 
 ## Flash
 

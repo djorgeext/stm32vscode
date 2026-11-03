@@ -10,30 +10,36 @@
   button:focus-visible { outline: 3px solid #0b57d0; outline-offset: 2px; }
   #status { font-size: 1.1rem; }
   figure { margin: 0; }
-  canvas { display: block; width: 100%; height: 60vh; border: 1px solid #767676; }
+  canvas { display: block; width: 100%; height: 34vh; border: 1px solid #767676; }
+  h2 { font-size: 1.1rem; margin: 0.5rem 0 0.25rem; }
 </style>
 </head>
 <body>
-<h1>ECG viewer (lead I)</h1>
+<h1>ECG viewer (leads I and II)</h1>
 <p><button id="connect" type="button">Connect</button></p>
 <p id="status"><span id="msg" role="status">Starting. If this stays, serve the page from the repo root with
   <code>python3 -m http.server -b 127.0.0.1 -d Projects/WeAct_MiniH750/Applications/USB_Device/PCG_CDC/Web 8000</code>
   and open http://localhost:8000/ecg.html.</span> <span id="stats"></span></p>
 <p id="leads" role="status"></p>
 <figure>
-  <canvas id="trace" role="img" aria-label="Live ECG, lead I, last 5 seconds, newest on the right"></canvas>
-  <figcaption>Lead I (LA − RA), 500 samples/s, filtered on the PC: 0.5–150 Hz band-pass and 50 Hz notch.
-    Last 5 s, newest on the right. The scale is in ADC counts, because the module's µV per count is not known.
-    For about 7 s after Connect the trace shows the module's input settling.</figcaption>
+  <h2>Lead I (LA − RA)</h2>
+  <canvas id="traceI" role="img" aria-label="Live ECG, lead I, last 5 seconds, newest on the right"></canvas>
+  <h2>Lead II (LL − RA)</h2>
+  <canvas id="traceII" role="img" aria-label="Live ECG, lead II, last 5 seconds, newest on the right"></canvas>
+  <figcaption>Leads I (LA − RA) and II (LL − RA), 500 samples/s, each filtered on the PC with its own copy of the
+    vendor's resting-ECG filters, always on: 0.25 Hz high-pass, 50 and 100 Hz notch, 40 Hz low-pass and 0.75 Hz baseline
+    filter. They run forward only, one sample at a time, so the traces have no delay, but T waves and ST segments look
+    different from the vendor's program. Last 5 s, newest on the right. Each trace has its own scale, in ADC counts,
+    because the module's µV per count is not known: compare amplitudes by the scale labels. Lead II needs the LL
+    electrode on the left leg. For about 2 s after Connect the traces show the module's input settling.</figcaption>
 </figure>
 <script type="module">
-import { createParser, createEcgFilter, RATE } from './ecg_dsp.js';
+import { createParser, createEcgFilter, electrodeLine, RATE } from './ecg_dsp.js';
 
 const RING = Math.round(5 * RATE); // 5 s
 const MIN_FULL = 50; // counts: QRS is about 40 and noise about ±4, so a quiet trace stays flat instead of filling the height
-const ring = new Float32Array(RING); // filtered values are fractional, and after a step to the rail they exceed int16
-let written = 0, dirty = true, full = MIN_FULL;
-let port = null, reader = null, parser = null, filter = null, stopping = false;
+let written = 0, dirty = true;
+let port = null, reader = null, parser = null, stopping = false;
 let t0 = 0, w0 = 0, keepAliveAt = 0;
 let writes = Promise.resolve();
 
@@ -41,8 +47,10 @@ const btn = document.getElementById('connect');
 const msg = document.getElementById('msg');
 const stats = document.getElementById('stats');
 const leads = document.getElementById('leads');
-const canvas = document.getElementById('trace');
-const ctx = canvas.getContext('2d');
+const traces = ['traceI', 'traceII'].map((id) => {
+  const canvas = document.getElementById(id);
+  return { canvas, ctx: canvas.getContext('2d'), ring: new Float32Array(RING), full: MIN_FULL, filter: null }; // filtered values are fractional, and after a step to the rail they exceed int16
+});
 
 msg.textContent = 'Not connected.';
 if (!('serial' in navigator)) {
@@ -56,16 +64,15 @@ btn.addEventListener('click', () => (port ? disconnect() : connect()));
 addEventListener('resize', () => (dirty = true));
 
 // Every write goes through this one chain, so the stop bytes always follow any queued start or keep-alive
-// and two writes never fight over the writer lock. Sends `first`, waits `ms`, sends `then` (protocol §6–§7).
-function send(first, ms, then) {
+// and two writes never fight over the writer lock. Each array is one write and each number a wait in ms (protocol §6–§7):
+// the vendor sends every command byte with its own WriteFile (protocol Appendix A 0x497270/0x497210/0x4972C0).
+function send(...steps) {
   const p = port;
   writes = writes
     .then(async () => {
       const w = p.writable.getWriter();
       try {
-        await w.write(new Uint8Array(first));
-        await new Promise((r) => setTimeout(r, ms));
-        await w.write(new Uint8Array(then));
+        for (const s of steps) await (typeof s === 'number' ? new Promise((r) => setTimeout(r, s)) : w.write(new Uint8Array(s)));
       } finally {
         w.releaseLock();
       }
@@ -94,16 +101,16 @@ async function connect() {
   port = p;
   stopping = false;
   parser = createParser();
-  filter = createEcgFilter();
+  for (const t of traces) { t.filter = createEcgFilter(); t.ring.fill(0); } // one chain per lead: each stage holds its lead's past samples
   keepAliveAt = 30000;
-  ring.fill(0);
   written = w0 = 0;
   t0 = performance.now();
   dirty = true;
   btn.textContent = 'Disconnect';
   msg.textContent = 'Connected.';
   stats.textContent = 'Measuring the frame rate…';
-  send([0x01], 100, [0x01, 0x09]); // start; no purge in Web Serial, so the marker hunt drops the start-up junk
+  // Stop first, as a tab closed without Disconnect leaves the module streaming; 5 ms keeps 01 and 09 in separate USB packets like the vendor's separate writes
+  send([0x02], 100, [0x02], 100, [0x01], 100, [0x01], 5, [0x09]); // start; no purge in Web Serial, so the marker hunt drops the start-up junk
   let error = '';
   while (port.readable && !stopping) {
     reader = port.readable.getReader();
@@ -111,7 +118,10 @@ async function connect() {
       for (;;) {
         const { value, done } = await reader.read();
         if (done) break;
-        for (const v of parser.push(value)) ring[written++ % RING] = filter(v);
+        for (const pair of parser.push(value)) {
+          traces.forEach((t, k) => (t.ring[written % RING] = t.filter(pair[k])));
+          written++;
+        }
         // Keep-alive every 30 000 frames (60 s) like the vendor program: counted, as Chrome throttles timers in hidden tabs
         if (parser.stats.frames >= keepAliveAt) {
           keepAliveAt += 30000;
@@ -128,7 +138,7 @@ async function connect() {
     }
   }
   await port.close().catch(() => {}); // after an unplug the port is already gone
-  port = reader = parser = filter = null;
+  port = reader = parser = null;
   btn.textContent = 'Connect';
   btn.disabled = false;
   if (stopping && document.activeElement === document.body) btn.focus(); // disabling dropped focus, which strands a keyboard user
@@ -152,7 +162,8 @@ function niceCeil(v) {
   return [1, 2, 5, 10].find((m) => m * p >= v) * p;
 }
 
-function draw() {
+function draw(t) {
+  const { canvas, ctx, ring } = t;
   const dpr = devicePixelRatio || 1;
   const W = Math.round(canvas.clientWidth * dpr), H = Math.round(canvas.clientHeight * dpr);
   if (canvas.width !== W || canvas.height !== H) {
@@ -175,7 +186,7 @@ function draw() {
     peak = Math.max(peak, -a, b);
   }
   // Symmetric around 0 and never below the peak, so no beat is clipped
-  full = niceCeil(Math.max(peak, MIN_FULL));
+  const full = (t.full = niceCeil(Math.max(peak, MIN_FULL)));
   const pad = 16 * dpr;
   const y = (c) => H / 2 - (c / full) * (H / 2 - pad);
 
@@ -207,19 +218,17 @@ function tick() {
   const now = performance.now();
   if (dirty) {
     dirty = false;
-    draw();
+    for (const t of traces) draw(t);
   }
   if (parser?.stats.frames) {
-    const { raOff, laOff } = parser.stats;
-    const off = raOff && laOff ? 'RA and LA electrodes' : raOff ? 'RA electrode' : laOff ? 'LA electrode' : '';
-    const t = off ? `Lead I not valid: ${off} off.` : 'RA and LA electrodes on.';
+    const t = electrodeLine(parser.stats);
     if (leads.textContent !== t) leads.textContent = t; // a live region announces every write
   }
   if (parser && now - t0 >= 1000) {
     const rate = Math.round(((written - w0) * 1000) / (now - t0));
     t0 = now;
     w0 = written;
-    stats.textContent = `${rate} frames/s, ${parser.stats.skipped} bytes skipped while syncing, scale ±${full} counts.`;
+    stats.textContent = `${rate} frames/s, ${parser.stats.skipped} bytes skipped while syncing, scale I ±${traces[0].full}, II ±${traces[1].full} counts.`;
   }
 }
 requestAnimationFrame(tick);
