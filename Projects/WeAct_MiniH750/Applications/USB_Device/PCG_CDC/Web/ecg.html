@@ -34,14 +34,14 @@
     electrode on the left leg. For about 2 s after Connect the traces show the module's input settling.</figcaption>
 </figure>
 <script type="module">
-import { createParser, createEcgFilter, electrodeLine, RATE } from './ecg_dsp.js';
+import { createParser, createEcgFilter, electrodeLine, createSender, START, KEEP_ALIVE, STOP, KEEP_ALIVE_FRAMES, RATE } from './ecg_dsp.js';
 
 const RING = Math.round(5 * RATE); // 5 s
 const MIN_FULL = 50; // counts: QRS is about 40 and noise about ±4, so a quiet trace stays flat instead of filling the height
 let written = 0, dirty = true;
 let port = null, reader = null, parser = null, stopping = false;
 let t0 = 0, w0 = 0, keepAliveAt = 0;
-let writes = Promise.resolve();
+let send = null;
 
 const btn = document.getElementById('connect');
 const msg = document.getElementById('msg');
@@ -63,24 +63,6 @@ if (!('serial' in navigator)) {
 btn.addEventListener('click', () => (port ? disconnect() : connect()));
 addEventListener('resize', () => (dirty = true));
 
-// Every write goes through this one chain, so the stop bytes always follow any queued start or keep-alive
-// and two writes never fight over the writer lock. Each array is one write and each number a wait in ms (protocol §6–§7):
-// the vendor sends every command byte with its own WriteFile (protocol Appendix A 0x497270/0x497210/0x4972C0).
-function send(...steps) {
-  const p = port;
-  writes = writes
-    .then(async () => {
-      const w = p.writable.getWriter();
-      try {
-        for (const s of steps) await (typeof s === 'number' ? new Promise((r) => setTimeout(r, s)) : w.write(new Uint8Array(s)));
-      } finally {
-        w.releaseLock();
-      }
-    })
-    .catch(() => {}); // an unplug: the read loop reports it, and the chain must keep working for the next connection
-  return writes;
-}
-
 async function connect() {
   btn.disabled = true; // port stays null until open settles, so a second click would start a second connect on the same port
   let p, opened = false;
@@ -99,18 +81,18 @@ async function connect() {
     if (document.activeElement === document.body) btn.focus(); // disabling dropped focus, which strands a keyboard user
   }
   port = p;
+  send = createSender(p);
   stopping = false;
   parser = createParser();
   for (const t of traces) { t.filter = createEcgFilter(); t.ring.fill(0); } // one chain per lead: each stage holds its lead's past samples
-  keepAliveAt = 30000;
+  keepAliveAt = KEEP_ALIVE_FRAMES;
   written = w0 = 0;
   t0 = performance.now();
   dirty = true;
   btn.textContent = 'Disconnect';
   msg.textContent = 'Connected.';
   stats.textContent = 'Measuring the frame rate…';
-  // Stop first, as a tab closed without Disconnect leaves the module streaming; 5 ms keeps 01 and 09 in separate USB packets like the vendor's separate writes
-  send([0x02], 100, [0x02], 100, [0x01], 100, [0x01], 5, [0x09]); // start; no purge in Web Serial, so the marker hunt drops the start-up junk
+  send(...START);
   let error = '';
   while (port.readable && !stopping) {
     reader = port.readable.getReader();
@@ -124,8 +106,8 @@ async function connect() {
         }
         // Keep-alive every 30 000 frames (60 s) like the vendor program: counted, as Chrome throttles timers in hidden tabs
         if (parser.stats.frames >= keepAliveAt) {
-          keepAliveAt += 30000;
-          send([0x09], 5, [0x09]);
+          keepAliveAt += KEEP_ALIVE_FRAMES;
+          send(...KEEP_ALIVE);
         }
         dirty = true;
       }
@@ -151,7 +133,7 @@ async function disconnect() {
   keepAliveAt = Infinity; // no keep-alive may follow the stop bytes
   const p = port;
   // writable.close() drains the OS transmit buffer, whereas port.close() aborts it and drops the last stop byte
-  await send([0x02], 100, [0x02]).then(() => p.writable.close()).catch(() => {}); // an unplug fails the drain: stop anyway
+  await send(...STOP).then(() => p.writable.close()).catch(() => {}); // an unplug fails the drain: stop anyway
   stopping = true;
   reader?.cancel().catch(() => {});
 }

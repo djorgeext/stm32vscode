@@ -26,9 +26,10 @@ void pcg_filter(const uint16_t *in, int16_t *out, int n)
       z[s][1] = c[2] * x - c[4] * y;
       x = y;
     }
+    if (i % PCG_DECIMATE != 0) continue; /* keeps samples 0, 48, ... of each block */
     /* +-32767 keeps 0x8000 free for the frame sync word */
     if (x > 32767.0) x = 32767.0;
     if (x < -32767.0) x = -32767.0;
-    out[i] = (int16_t)(x < 0 ? x - 0.5 : x + 0.5);
+    *out++ = (int16_t)(x < 0 ? x - 0.5 : x + 0.5);
   }
 }

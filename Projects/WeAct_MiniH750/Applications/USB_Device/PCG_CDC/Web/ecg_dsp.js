@@ -87,3 +87,30 @@ export function createEcgFilter() {
   let x0 = null;
   return (x) => stages.reduce((v, f) => f(v), x - (x0 ??= x));
 }
+
+// Stop first, as a tab closed without Disconnect leaves the module streaming; 5 ms keeps 01 and 09 in separate USB packets like the vendor's separate writes.
+// No purge in Web Serial, so the marker hunt drops the start-up junk.
+export const START = [[0x02], 100, [0x02], 100, [0x01], 100, [0x01], 5, [0x09]];
+export const KEEP_ALIVE = [[0x09], 5, [0x09]];
+export const STOP = [[0x02], 100, [0x02]];
+export const KEEP_ALIVE_FRAMES = 30000; // 60 s, like the vendor program
+
+// Every write goes through this one chain, so the stop bytes always follow any queued start or keep-alive
+// and two writes never fight over the writer lock. Each array is one write and each number a wait in ms (protocol §6–§7):
+// the vendor sends every command byte with its own WriteFile (protocol Appendix A 0x497270/0x497210/0x4972C0).
+export function createSender(port) {
+  let writes = Promise.resolve();
+  return (...steps) => {
+    writes = writes
+      .then(async () => {
+        const w = port.writable.getWriter();
+        try {
+          for (const s of steps) await (typeof s === 'number' ? new Promise((r) => setTimeout(r, s)) : w.write(new Uint8Array(s)));
+        } finally {
+          w.releaseLock();
+        }
+      })
+      .catch(() => {}); // an unplug: the read loop reports it, and the chain must keep working for the next send
+    return writes;
+  };
+}

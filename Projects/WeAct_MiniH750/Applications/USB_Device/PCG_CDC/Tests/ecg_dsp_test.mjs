@@ -2,7 +2,7 @@
 // From the project folder: node Tests/ecg_dsp_test.mjs
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createParser, createEcgFilter, electrodeLine, FRAME_BYTES, RATE } from '../Web/ecg_dsp.js';
+import { createParser, createEcgFilter, electrodeLine, createSender, START, KEEP_ALIVE, STOP, KEEP_ALIVE_FRAMES, FRAME_BYTES, RATE } from '../Web/ecg_dsp.js';
 
 // One frame: blocks 01/02/03 C0, status A1 B1, then V5 I II III big-endian. Lead II defaults to ~leadI, which is never
 // leadI and stays inside int16 (~-32768 = 32767), so a swapped or wrong offset shows. m replaces the C0 marker bytes
@@ -178,4 +178,53 @@ test('electrode line names the invalid leads', () => {
   const p = createParser();
   p.push(frame(0));
   assert.equal(electrodeLine(p.stats), 'Lead II not valid: LL electrode off.');
+});
+
+// A writer that records each write and when. getWriter throws while locked, as a real stream does
+function stubPort() {
+  const port = { writes: [], failNext: false, locked: false };
+  port.writable = {
+    getWriter() {
+      if (port.locked) throw new TypeError('locked');
+      port.locked = true;
+      return {
+        write: async (bytes) => {
+          if (port.failNext) {
+            port.failNext = false;
+            throw new Error('The device has been lost.');
+          }
+          port.writes.push({ bytes: Array.from(bytes), t: performance.now() });
+        },
+        releaseLock: () => (port.locked = false),
+      };
+    },
+  };
+  return port;
+}
+
+test('commands go out one byte per write, in order', async () => {
+  const port = stubPort();
+  const send = createSender(port);
+  const start = send(...START);
+  await new Promise((r) => setTimeout(r, 150)); // mid-sequence, between the second 02 and the first 01
+  const stop = send(...STOP);
+  await start;
+  const gaps = port.writes.slice(1, 5).map((w, k) => w.t - port.writes[k].t);
+  assert.deepEqual(port.writes.slice(0, 5).map((w) => w.bytes), [[0x02], [0x02], [0x01], [0x01], [0x09]]);
+  [95, 95, 95, 4].forEach((min, k) => assert.ok(gaps[k] >= min, `gap ${k}: ${gaps[k]} ms`));
+  await stop;
+  assert.deepEqual(port.writes.slice(5).map((w) => w.bytes), [[0x02], [0x02]], 'the stop follows the 09');
+
+  port.failNext = true;
+  await send(...KEEP_ALIVE); // resolves: the lost write ends this send and must not break the chain or keep the lock
+  assert.equal(port.writes.length, 7);
+  await send(...KEEP_ALIVE);
+  assert.deepEqual(port.writes.slice(7).map((w) => w.bytes), [[0x09], [0x09]]);
+});
+
+test('the command constants keep the values proven on the module', () => {
+  assert.deepEqual(START, [[0x02], 100, [0x02], 100, [0x01], 100, [0x01], 5, [0x09]]);
+  assert.deepEqual(KEEP_ALIVE, [[0x09], 5, [0x09]]);
+  assert.deepEqual(STOP, [[0x02], 100, [0x02]]);
+  assert.equal(KEEP_ALIVE_FRAMES, 30000);
 });

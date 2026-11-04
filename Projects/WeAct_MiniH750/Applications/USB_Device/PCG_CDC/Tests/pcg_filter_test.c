@@ -20,17 +20,18 @@ static double gain_db(double f)
       in[i] = (uint16_t)lrint(32768.0 + AMP * sin(2 * M_PI * f * (n0 + i) / FS));
     pcg_filter(in, out, BLOCK);
     if (n0 >= FS)
-      for (int i = 0; i < BLOCK; i++)
+      for (int i = 0; i < BLOCK / PCG_DECIMATE; i++)
         sum += (double)out[i] * out[i];
   }
-  return 20 * log10(sqrt(sum / FS) / (AMP / sqrt(2)));
+  return 20 * log10(sqrt(sum / (FS / PCG_DECIMATE)) / (AMP / sqrt(2)));
 }
 
 int main(void)
 {
   /* {tone Hz, min dB, max dB} */
   static const double cases[][3] = {
-    {100, -0.5, 0.5}, {20, -3.5, -2.5}, {200, -3.5, -2.5}, {2, -1e9, -30}, {2000, -1e9, -30},
+    {100, -0.5, 0.5}, {20, -3.5, -2.5}, {200, -3.5, -2.5}, {2, -INFINITY, -30}, {2000, -INFINITY, -30},
+    {600, -39, -37}, {800, -49, -47},
   };
   int fails = 0;
   for (unsigned k = 0; k < sizeof cases / sizeof cases[0]; k++)

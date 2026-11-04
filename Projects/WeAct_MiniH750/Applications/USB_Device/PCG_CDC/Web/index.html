@@ -28,13 +28,14 @@
 <p><span id="amsg" role="status">Audio off.</span> <span id="astats"></span></p>
 <figure>
   <canvas id="trace" role="img" aria-label="Live PCG trace of the last 5 seconds, newest on the right"></canvas>
-  <figcaption>PA6 band-passed 20–200 Hz on the board, sampled at 48 kHz. Last 5 s, newest on the right.
+  <figcaption>PA6 sampled at 48 kHz, band-passed 20–200 Hz and reduced to 1000 samples/s on the board. Last 5 s, newest on the right.
     The vertical scale fits the largest sample in view (mV = counts × 3300 / 65536).</figcaption>
 </figure>
 <script type="module">
-import { createParser } from './pcg_parser.js';
+import { createParser, RATE } from './pcg_parser.js';
+import { createUpsampler } from './upsample.js';
 
-const RING = 5 * 48000; // 5 s, a whole number of 480-sample frames, so ring.set never wraps
+const RING = 5 * RATE; // 5 s, a whole number of 10-sample frames, so ring.set never wraps
 const MV_PER_COUNT = 3300 / 65536;
 const MIN_FULL_MV = 50; // keeps a quiet input flat instead of blowing ADC noise up to full height
 const ring = new Int16Array(RING);
@@ -77,14 +78,18 @@ addEventListener('pageshow', (e) => {
 });
 
 async function connect() {
+  btn.disabled = true; // port stays null until open settles, so a second click would start a second connect on the same port
   let p;
   try {
     p = await navigator.serial.requestPort({ filters: [{ usbVendorId: 0x0483, usbProductId: 0x5740 }] });
-    // CDC ignores the baud rate; the default 255-byte buffer is small for 96 KB/s
+    // CDC ignores the baud rate; the default 255-byte buffer holds only 100 ms at 2400 B/s
     await p.open({ baudRate: 115200, bufferSize: 65536 });
   } catch (e) {
     msg.textContent = `Not connected: ${e.message}`;
     return;
+  } finally {
+    btn.disabled = false;
+    if (document.activeElement === document.body) btn.focus(); // disabling dropped focus, which strands a keyboard user
   }
   port = p;
   stopping = false;
@@ -97,6 +102,7 @@ async function connect() {
   msg.textContent = 'Connected.';
   stats.textContent = 'Measuring the sample rate…';
   let error = '', frames = 0;
+  const up = createUpsampler(48); // the player runs at 48 kHz and cannot run at 1 kHz
   while (port.readable && !stopping) {
     reader = port.readable.getReader();
     try {
@@ -107,7 +113,7 @@ async function connect() {
           ring.set(s, written % RING);
           written += s.length;
           // The first frame after each open is the device's stale queued frame (step 4e): spliced before live audio it clicks
-          if (frames++ > 0) audioNode?.port.postMessage(s);
+          if (frames++ > 0 && audioNode) audioNode.port.postMessage(Int16Array.from(Array.from(s).flatMap((v) => up(v))));
         }
         dirty = true;
       }
@@ -134,7 +140,7 @@ async function startAudio() {
   const refocus = document.activeElement === abtn; // disabling drops focus, which strands a keyboard user
   abtn.disabled = true;
   try {
-    // Created inside the click (the autoplay rule) at the stream rate, so the page needs no resampler
+    // Created inside the click (the autoplay rule) at the 48 kHz the read loop upsamples the stream to
     actx = new AudioContext({ sampleRate: 48000 });
     await actx.audioWorklet.addModule('pcg_audio.js');
     const node = new AudioWorkletNode(actx, 'pcg-player', {
@@ -144,7 +150,8 @@ async function startAudio() {
     });
     node.port.onmessage = ({ data: s }) =>
       (astats.textContent = `Audio: ${Math.round(s.fill / 48)} ms buffered, ${s.underruns} underruns, ${s.slips} slips.`);
-    node.connect(actx.destination);
+    // Removes the interpolator's images near 1 kHz, where the ear is most sensitive
+    node.connect(new BiquadFilterNode(actx, { type: 'lowpass', frequency: 300, Q: -3 })).connect(actx.destination);
     audioNode = node;
     abtn.textContent = 'Stop audio';
     amsg.textContent = 'Audio on.';
@@ -188,7 +195,8 @@ function draw() {
   let peak = 0;
   for (let x = 0; x < W; x++) {
     let a = 32767, b = -32767;
-    for (let k = Math.floor((x * RING) / W), e = Math.floor(((x + 1) * RING) / W); k < e; k++) {
+    // At least one sample per column: the 5000-sample ring can be narrower than the canvas
+    for (let k = Math.floor((x * RING) / W), e = Math.max(k + 1, Math.floor(((x + 1) * RING) / W)); k < e; k++) {
       const v = ring[(written + k) % RING];
       if (v < a) a = v;
       if (v > b) b = v;

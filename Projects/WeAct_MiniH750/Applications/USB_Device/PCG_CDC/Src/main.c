@@ -1,19 +1,21 @@
-/* PCG_CDC: samples PA6 at 48 kHz, band-passes it 20-200 Hz and streams it over
-   USB CDC as little-endian int16 frames, one every 10 ms:
-   [0x8000 sync][seq 0-32767, wrapping][480 filtered samples] */
+/* PCG_CDC: samples PA6 at 48 kHz, band-passes it 20-200 Hz, keeps every 48th
+   sample and streams it over USB CDC as little-endian int16 frames, one every
+   10 ms:
+   [0x8000 sync][seq 0-32767, wrapping][10 filtered samples at 1000 Hz] */
 #include "main.h"
 #include "usb_device.h"
 #include "usbd_cdc_if.h"
 #include "pcg_filter.h"
 
-#define HALF 480 /* samples per DMA half and per frame: 10 ms at 48 kHz */
+#define HALF 480 /* samples per DMA half: 10 ms at 48 kHz */
+#define FRAME_SAMPLES (HALF / PCG_DECIMATE) /* 10 samples at 1000 Hz */
 
 ADC_HandleTypeDef hadc1;
 static TIM_HandleTypeDef htim3;
 /* DMA target: all RAM is AXI SRAM (DMA1 cannot reach DTCM) and the D-cache stays off */
 static uint16_t adc_buf[2 * HALF];
 static volatile uint32_t halves_done; /* even count: the first half is next to read */
-static int16_t frame[2 + HALF];
+static int16_t frame[2 + FRAME_SAMPLES];
 
 static void SystemClock_Config(void);
 static void ADC1_Init(void);

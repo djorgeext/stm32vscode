@@ -844,3 +844,527 @@ EOF
 - **Open questions, kept:**
   - Does the module have an LED that shows streaming?
   - The µV per count (§13, question 1): the vendor's display code was not traced, so a known 1 mV signal remains the way to calibrate.
+
+# PLAN: synchronized ECG + PCG recorder
+
+**Goal:** one page, `Web/recorder.html`, where one Start button records ECG lead II and PCG to disk at a nominal 1000 Hz each, shows both live, and keeps everything the user needs to correct the drift offline.
+
+**The user's requests (2026-11-04), verbatim:**
+
+- "I want now an app browser that show me both signal ECG lead II and PCG, due to I need to recording simultaneously both signals I want you to create a start button which enable the measuring in both devices at the same time, so after having finished I will do the drift correction offline."
+- "After the digital lowpass PCG signal, apply a downsampling until 1000 Hz to the PCG signal inside the stm32"
+- "Also make upsampling to the ecg up to 1000 Hz after the lowpass filtering for having a paired signal with the same frequency sampling"
+- "Ok, I agree with that saving the unfiltered ECG"
+
+**This section changes the PCG wire format and the firmware.** The two sections above stay as history. Where they disagree with this one (48 kHz on the wire, 964-byte frames, "no firmware change", "no recording"), this section wins. Step 6c of the PCG plan, the headphone check, stays open.
+
+`P` = `Projects/WeAct_MiniH750/Applications/USB_Device/PCG_CDC`. ✅ = read from the code or computed by the planner. 🔶 = estimated, not measured.
+
+## Decisions
+
+### What "start both at the same time" can mean
+
+- **What the devices do:**
+  - ✅ The STM32 streams from power-up with no start command. `main()` starts the ADC, TIM3 and DMA before its loop, and `CDC_Receive_FS` throws host bytes away. `seq` counts DMA halves since power-up, so it is already an exact sample clock.
+  - ✅ The ECG module must be started: the stop-first sequence takes 305 ms, and the input settles for about 2 s after that. Nothing tells us how long the module takes from `01` to its first valid sample, and its frames carry no counter.
+- **Design: one Start button, gating on the PC, no start command.** Start opens both ports, starts both read loops in the same tick and sends the ECG start sequence. From then on every received chunk goes to disk with a `performance.now()` stamp, one clock for both streams.
+  - PCG chunks are being logged within about 20 ms of Start. ECG frames follow about 0.5 s later 🔶 and are settled about 2 s later.
+  - "The same time" therefore means that both records cover the same interval and both map onto one host clock. It does not mean a shared first sample, which neither device can give. The user trims the start offline.
+- **Firmware options for alignment, all rejected except A.** The flash for the decimation is paid anyway, so cost is not the reason. They buy nothing, because the weak link is the ECG path, which we cannot change.
+
+  | Option | What it buys | Alignment after the offline fit |
+  |---|---|---|
+  | **A. Host timestamps on both streams (chosen)** | Works with what exists | Under 0.5 ms random, plus a constant unknown path difference of about ±3 ms 🔶 |
+  | B. Start/stop command to the STM32 | The PCG file starts about 2 ms 🔶 after a command | Same as A: the ECG's first sample must still be placed by host timestamps, and `seq` is already exact |
+  | C. Wider sample counter | Removes the 327.68 s `seq` wrap | Same as A: only an outage above 5.46 min could alias, and the host timestamps resolve that |
+  | D. STM32 echoes host pings, NTP style | PCG to host offset down to about 0.5 ms 🔶 | Same as A: the ECG path is unchanged |
+  | E. A hardware trigger seen by both | Under 1 ms | Rejected: it needs a wire into a device connected to the body |
+
+- **Alignment budget for the chosen design.** All of these are per recording, with the fit from "Recording" below:
+
+  | Term | Size | Note |
+  |---|---|---|
+  | Clock drift before correction | ✅ about 240 ppm from E1's 500.12 frames/s: 1 ms every 4 s, 14 ms/min | A rough figure from a 10 s run. The fit removes it |
+  | Random error left after the fit | ✅ under 0.5 ms (spread under 0.2 ms) for 60 s or more | Planner's simulation: 2 ms exponential jitter plus 2 % outliers of 30 ms, 100 and 250 stamps/s, plain least squares. A model: S10 measures the real jitter |
+  | Timestamp resolution | 🔶 0.1 ms | Chrome without cross-origin isolation, from memory, not checked here |
+  | Path difference, constant | 🔶 about ±3 ms, not measured and staying so (Not doing) | ECG: 1.7 ms UART plus MCP2200 plus USB. PCG: about 1 ms from the last kept sample to the end of the DMA half, plus filter time and USB. The mean jitter of each path lands in this term too. Constant within a session, so it moves every S1 by the same amount |
+  | Board filter delay on PCG | ✅ 3.2 ms at 100–200 Hz, 5.7 ms at 50 Hz, 8.0 ms at 40 Hz, 14.1 ms at 30 Hz, 31.5 ms at 20 Hz | From `sos` in `pcg_filter.c`. It depends on frequency, so it is a phase correction offline, not one shift |
+  | PC filter delay on stored lead II | ✅ QRS 10 ms, 12–17 ms over 10–40 Hz (ECG plan) | The raw counts have none. The module's own internal delay is unknown |
+
+- **A cheap offline cross-check:** mains hum, if it shows in both raw records, is a common reference independent of the PC. The file already holds what that needs.
+
+### PCG firmware: 48 kHz in, 1000 Hz out (one flash)
+
+- **Order, as the user asked:** ADC at 48 kHz → the existing 20–200 Hz band-pass, run on every sample → keep one sample in 48 → USB. The filter still runs for every sample of every DMA half, sent or not, so its state stays continuous.
+- **Is the 4th-order 200 Hz low-pass enough as anti-alias filter? For the 20–200 Hz band yes, as a brick wall at 500 Hz no.** Gain of the real coefficients, ✅ computed and ✅ confirmed by a dry-run of the decimating code at 600 and 800 Hz:
+
+  | Input | 500 Hz | 600 Hz | 800 Hz | 950 Hz | 1000 Hz | 1200 Hz |
+  |---|---|---|---|---|---|---|
+  | Gain | −31.85 dB | −38.19 dB | −48.19 dB | −54.18 dB | −55.97 dB | −62.32 dB |
+  | Folds to | 500 Hz | 400 Hz | 200 Hz | 50 Hz | 0 Hz | 200 Hz |
+
+  - Only input at 800–1200 Hz (and 1800–2200 Hz, and so on) can fold into 20–200 Hz, and it is at least 48 dB down. A full-scale 800 Hz tone would alias to about ±127 counts. White ADC noise folded into the band is −50.3 dB against the noise already there.
+  - Between 200 and 500 Hz the output holds the filter's skirt plus alias from 500–800 Hz at −32 to −48 dB. Do not analyse above 200 Hz.
+- **Plain keep-every-48th is enough.** Averaging 48 samples would add −12.6 dB at 800 Hz, but it costs −0.58 dB at 200 Hz and 0.5 ms more delay, for no gain the band needs.
+- **Which samples:** 0, 48, 96, … 432 of each 480-sample DMA half, so 1 kHz sample `j` is ADC sample `48·j`.
+- **In `pcg_filter()`, not a new function:** two changed lines, and the host test exercises the real path. No start command and no wider counter go in the same flash (table above).
+- **No change** to clocks, GPIO, ADC, DMA, TIM3, USB glue, the linker script, CMake (`Src/*.c` is a glob) or `stm32h7xx_hal_conf.h`. PA13/PA14 and PA6 are not touched.
+
+### Wire format
+
+- **`[0x8000 sync][seq 0–32767, wrapping][10 int16 samples]`, little-endian, 24 bytes every 10 ms, 2400 B/s** (it was 964 bytes and 96 400 B/s). Only the sample count changes, which is the smallest change.
+  - The DMA half stays at 480 samples, so the firmware loop and the meaning of `seq` stay the same, and a gap still means a frame dropped because the host was not reading.
+  - **Every sample's index follows from `seq`:** `10·unwrapped_seq + k` at 1 kHz, exact across drops.
+  - 100 frames/s keep 100 host timestamps/s for the fit, one short USB packet each. A 100 ms frame would save 4 bytes per 10 samples, but costs 90 % of the timestamps and 100 ms of display lag.
+- **Sync rule unchanged:** two syncs one frame apart with different `seq`. The planner's dry-run of the test file below passes 10/10, and 600 000 hunts on quiet synthetic data gave 0 false locks. A false lock would cost one bad frame in the display, and the raw file is unaffected.
+
+### Audio stays, at the cost of about 10 lines
+
+`pcg_audio.js` assumes 48 kHz and 480-sample pushes. An `AudioContext` cannot run at 1 kHz (browsers support about 3 kHz and up), so the stream must be upsampled.
+
+- **The page upsamples by 48 with the same linear interpolator as the ECG,** then posts 480 samples per frame as today. So `pcg_audio.js` and `pcg_audio_test.mjs` stay byte-identical.
+- **One `BiquadFilterNode` low-pass at 300 Hz** before the destination, a platform feature, removes the interpolator's images. ✅ Linear alone leaves the image of 100 Hz at 900 Hz at −38 dB, where the ear is far more sensitive than at 100 Hz. With the biquad it is −57 dB. The image of 200 Hz goes from −24 to −40 dB. Droop at 100 Hz is −0.34 dB in all, and at 200 Hz −1.9 dB.
+- **Not proven by any test:** the user has not done step 6c, and that check now runs on this upsampled audio. If the sound is worse, it goes back to the planner.
+
+### ECG lead II at 1000 Hz
+
+- **Where in the chain: after the whole §12 chain, after the 0.75 Hz stage.** That stage comes after the 40 Hz FIR and its coefficients are for 500 Hz. Interpolating between the FIR and it would need a new design at 1 kHz, and the protocol warns that the vendor's 1000 Hz baseline filter is numerically fragile (§12.3). It adds nothing above 40 Hz, so the signal is still "after the low-pass". `createEcgFilter()` stays byte-identical.
+- **Method: linear, one midpoint between neighbours.** `y[2m] = x[m]`, `y[2m+1] = (x[m] + x[m+1]) / 2`.
+  - **Fixed 2:1 map:** N frames give 2N − 1 samples, and `y[j]` is frame `j/2` (odd `j` is halfway between two frames).
+  - **Error at 40 Hz:** ✅ original samples exact, midpoints low by 3.14 % of the amplitude, 1.57 % RMS over all output, 33 dB SNR. At 15 Hz, where the QRS lives, midpoints are 0.44 % low. Image at 460 Hz: −36 dB.
+  - **Delay: none.** Frame `m+1` arrives, and both `y[2m+1]` and `y[2m+2]` come out at once. Nothing waits for a later frame.
+  - **Rejected:** a 4-point midpoint gives 0.15 % at 40 Hz but needs the next frame, so 2 ms of delay. The user chose no delay, and the raw counts are in the file anyway.
+- **One function for both uses:** `createUpsampler(L)` in `Web/upsample.js`, L = 2 for ECG and L = 48 for audio.
+
+### What "the same rate" does and does not give
+
+The 1000 Hz ECG stays on the module's clock and the 1000 Hz PCG on the STM32's clock. **The rates match only nominally: sample `j` of one is not simultaneous with sample `j` of the other, and at E1's rate the two slide apart by 1 ms every 4 s or so.** The page does not correct this, and the user does the correction offline from each stream's sample indices plus the host timestamps. The page caption, the first record of every file, the README and the loader's output all carry this exact text, `ALIGN_NOTE` in `recorder.js`:
+
+"ECG and PCG are both nominally 1000 Hz, but each runs on its own clock (ECG: the module, PCG: the STM32). Sample j of one is not simultaneous with sample j of the other. Align them offline with each stream's sample index and the host timestamps. The fixed offset between the two paths is not measured: about ±3 ms, an estimate."
+
+### Recording
+
+- **Bytes as received, not decoded values.** Each chunk from each port is logged whole, before any parsing, so a parser bug cannot damage a recording. Keeping values in the form the platform gives them also needs the least code.
+- **User decision, 2026-11-04:** the unfiltered module counts stay in the file, next to the filtered, upsampled lead II. The 40-byte frames also carry lead I, the electrode-off flags and the battery byte, at no extra cost, and they are the frame numbering that `y[j]` maps onto.
+- **Layout:** one folder per recording, `ecgpcg-YYYYMMDD-HHMMSS/`, holding `00001.ecgpcg`, `00002.ecgpcg`, … Concatenated in name order, they form one log of records, little-endian. A file only ever ends on a record boundary.
+
+  | Offset | Type | Field |
+  |---|---|---|
+  | 0 | f64 | `t`: `performance.now()` in ms, taken first thing after the read resolved. One clock for all kinds |
+  | 8 | u32 | `n`: payload bytes |
+  | 12 | u8 | `kind` |
+  | 13 | n bytes | payload |
+
+  | `kind` | Payload |
+  |---|---|
+  | 1 | PCG bytes exactly as received: 24-byte frames, cut wherever the chunk was cut |
+  | 2 | ECG bytes exactly as received: 40-byte frames, cut wherever the chunk was cut |
+  | 3 | Event, UTF-8 JSON |
+  | 4 | Filtered, upsampled lead II as f32, continuing the previous kind 4 record. Same `t` as the kind 2 record it came from |
+
+  | Event `e` | When | Other fields |
+  |---|---|---|
+  | `start` | First record | `format: 1`, `wall` (`Date.now()`), `note` (`ALIGN_NOTE`), `pcg_hz: 1000`, `ecg_frame_hz: 500`, `ecg_1k_hz: 1000` |
+  | `ecg-start-sent` | After the last start byte is written | |
+  | `keep-alive` | When queued | `frames` |
+  | `read-error` | A read failed but the port lives: bytes may be missing here | `stream`, `message` |
+  | `lost` | A stream ended without Stop | `stream`, `message` |
+  | `stop` | Last record of a clean end | |
+
+- **Gaps stay visible in the file, never silent:**
+  - **PCG:** a `seq` gap gives the exact number of missing frames.
+  - **ECG:** there is no counter. Lost bytes show as a marker hunt, whose byte position the loader reports, and the size of the loss follows from the host timestamps (a frame is 2 ms, under the rolling residual).
+  - **Between recordings:** a missing segment file shows as a gap in the numbering, which the loader reports.
+  - **Stale first PCG frame:** always present, queued while the port was closed. Its timestamp means nothing, so the loader drops it, as `index.html` does.
+- **Data rate:** payload 2400 + 20 000 + 4000 = 26 400 B/s. Headers add 1.3 KB/s for PCG, and up to 26 KB/s for ECG if its chunks arrive every millisecond 🔶 (S10 measures it). So 28–54 KB/s, or 100–195 MB per hour, against 116 KB/s before the decimation.
+- **Loader: `P/Tools/load_recording.py`, about 100 lines, numpy only.** Justified, because it is the format's real documentation, it is what the self-check reads back with, and it gives the tester a summary of counts on real recordings with no samples printed. It does not correct drift. Its summary fits `t = a + b·n` with plain least squares only to report rates, in ppm against the host clock. In the simulation, least squares did better than a lower envelope below about 5 min and worse at 30 min, so the choice stays with the user.
+
+### Data safety
+
+- **Disk, not memory.** Memory would lose everything in a tab crash. A single file from `showSaveFilePicker` plus `createWritable()` would not help either: the data sits in a swap file and reaches the named file only on `close()`.
+- **So: one small file per segment.** `showDirectoryPicker()`, and every 256 KiB (5–9 s at these rates) the current records go through `createWritable()`, `write()` and `close()` as one new file. Each file is committed whole. The roll is counted in bytes in the read loop, because Chrome throttles timers in hidden tabs.
+
+  | Event | What happens |
+  |---|---|
+  | **Stop** | ECG stop, drain, cancel both readers, `stop` event, final segment written, status names the folder |
+  | **Tab crash or killed tab** | Everything but the last 5–9 s is on disk. The module keeps streaming, and the next Start's stop-first recovers it (tested in E4) |
+  | **Unplug of one device** | `lost` event and a warning that stays. The other stream keeps recording. No auto-reconnect: the board reboots, and `seq` restarts |
+  | **Unplug of both** | The session ends itself and writes the last segment |
+  | **Dropped PCG frame** | Counter on the page, `seq` gap in the file, recording continues |
+  | **Lost ECG sync** | Counter on the page, marker hunt in the file, recording continues |
+  | **Disk write fails** | The segment stays in memory and is retried at the next roll and at Stop. A warning stays up, and the button offers Retry save after Stop |
+  | **Closing or reloading the tab while recording or unsaved** | `beforeunload` asks first |
+
+- **Recordings are health data and never land in the repo.** `startIn: 'documents'` opens outside the repo, a page cannot learn a folder's full path to check it, and Chrome may refuse `~/Documents` itself, so the user makes a subfolder.
+- **`.gitignore` needs one line, `ecgpcg-*/`,** which also covers any `.crswap` left by a crash. It is defence in depth against a folder picked by mistake inside the repo.
+
+### Page
+
+- **`Web/recorder.html` + `Web/recorder.js`**, next to the others, with the logic in the module so node can test it, as with `pcg_parser.js` and `ecg_dsp.js`. No backend, no npm. Chrome or Edge on `http://localhost:8001/recorder.html`. Port 8000 is left alone.
+- **What the user clicks:** `requestPort()` needs a gesture per port, so **Allow device** (filter on both VID:PIDs, one device per click) is needed once per device. Chrome should remember the grant where the device has a serial number 🔶 (the board has one, the module is unknown), and after that `getPorts()` finds both by `getInfo()` with no click. If a grant is not remembered, the page says so and Allow device is one more click. **Start** is enabled when both are found. The first Start of a session also asks for the folder, using that click's gesture. Later Starts use the same folder, so a normal session is one click.
+- **Connect guard, as `ecg.html`:** the button is disabled for the whole attempt, an `opened` list closes only ports this attempt opened, and focus is restored. `index.html` got the same guard in S3 (user decision, 2026-11-04).
+- **Traces on one time base:** both draw the 1000 Hz signals in 5000-sample rings, so 5 s has the same width in both traces. ✅ One `draw(t)` costs 0.06–0.09 ms at this ring size, against 1.6 ms for the 48 kHz ring (node v23, 1900–3800 columns). The two-trace page spends under 0.2 ms per animation frame, so drawing cannot disturb the read loops. The right edges are each stream's newest sample, so this is not a sample-level alignment.
+- **`draw(t)` is copied from `ecg.html`, with a unit and a scale factor.** Not shared: `index.html` keeps its own, and sharing would change a verified page for no user benefit.
+- **ECG start, keep-alive and stop are shared, not copied:** the sequences and `send()` move from `ecg.html` into `ecg_dsp.js`, which the page already imports. Those bytes made the module go deaf once, so one copy is worth a small change to a verified page. S9 re-proves it on the module.
+- **Display:** ECG lead II with the forward-only chain, PCG in mV, Start/Stop as one toggling button like Connect/Disconnect (disabled while starting, so a double click cannot stop), electrode-off warning for RA and LL, PCG dropped frames, ECG frames/s, bytes lost after lock, recording length, files saved, status text. Accessibility as in `ecg.html`: `role="status"` for state text only, numbers in a plain span, labelled canvases, visible focus, a caption.
+
+### PCG front end (user, 2026-11-04)
+
+- PA6 is connected only to the PCG PCB's filter output. That PCB runs from a 9 V battery.
+- The user reports that the output does not go above 3 V. Earlier measurements (step 4c) read 0–1.598 V, mean 0.951 V.
+- **Nothing in the software can show a short excursion.** The board's filter hides it in the stream, and step 4c's reads were spot checks about 25 ms apart.
+- **The 3 V limit is by design (user, 2026-11-04):** a voltage divider on the PCB limits the output to 3 V.
+- **The PCB stays live when the board has no power,** so its output still drives PA6 then. What that does to an unpowered chip was not checked against DS12556, so S11 item 1 takes the signal wire off PA6 first.
+- No hardware change is planned.
+
+### Everything this reaches
+
+| Place | Change |
+|---|---|
+| `Inc/pcg_filter.h`, `Src/pcg_filter.c`, `Src/main.c` | Decimation, 10 samples per frame |
+| `Tests/pcg_filter_test.c` | 1 kHz output, two alias cases, `-INFINITY` |
+| `Web/pcg_parser.js`, `Tests/pcg_parser_test.mjs` | Frame size, `RATE`, test sizes |
+| `Web/index.html` | Ring, column guard, caption, audio upsampling, biquad, and the Connect fix, which went in with S3 (user decision, 2026-11-04) |
+| `Web/pcg_audio.js`, `Tests/pcg_audio_test.mjs` | **Byte-identical** |
+| `Web/upsample.js`, `Tests/upsample_test.mjs` | New |
+| `Web/ecg_dsp.js`, `Web/ecg.html`, `Tests/ecg_dsp_test.mjs` | `send()` and the sequences move, no behaviour change, one new test |
+| `Web/recorder.js`, `Web/recorder.html`, `Tests/recorder_test.mjs`, `Tools/load_recording.py` | New |
+| `.gitignore` | `ecgpcg-*/` |
+| `P/README.md`, `Acquisition_systems_summary.md` | Rates, frame, recorder section |
+| `ECG_viewer_status.md` | Only the double-Connect reminder goes, fixed in S3 |
+| `.vscode/`, `STM32 LED Blink Quick Guide.md`, root `README.md`, CMake, linker script, HAL config | **No change:** a grep finds no rate or frame size stated there |
+
+## Steps
+
+Commands run from `P` unless they say "repo root". `$S` is a scratch folder outside the repo.
+
+| Step | Who | Device? |
+|---|---|---|
+| S1 | Tester | Read-only look, no port opened |
+| S2–S7 | Executioner, then tester | None |
+| S8 | Tester, with a stop-and-ask | Flash |
+| S9–S12 | User and tester | Both devices, sensors connected |
+
+S2–S7 all come before the flash so that the viewers work the moment the board changes, and the user disconnects once.
+
+**If time is short.** Every step stays in the plan. This is the order of need for a first usable recording:
+
+| Step | For a first usable recording | If it comes later, the risk left |
+|---|---|---|
+| S5, S6 | **Essential** | A format or loader fault is found only after a real recording |
+| S7: page and `.gitignore` | **Essential** | |
+| S7: `P/README.md`, `Acquisition_systems_summary.md`, `ECG_viewer_status.md` | Later | None to the data: each recording carries `ALIGN_NOTE` |
+| S8, all checks | **Essential** | |
+| S9 items 1 and 2, with the listen | **Essential** | |
+| S9 items 3 and 4 | Later | An audio or double-click fault stays unseen. Neither touches the recorder |
+| S10 | **Essential.** It can be the first real recording: record longer if you want, and keep it | |
+| S11 | Later, after the first real recording | Unplug, killed tab and busy port are proven only in the node tests, not on the real devices. Files already written are separate and closed, so they should survive, but a real crash is unproven |
+| S12 | Later, or met by a first real recording of 10 minutes or more | Runs over 3 minutes are unproven with the recorder. The loader's summary after that recording shows any fault, and the files up to it stay |
+| Step 6c | Later | None to the recorder |
+
+**Rules for anything that touches a device:**
+
+- Only the tester runs device commands, and only the user clicks in pages.
+- **Ports are found by VID:PID, never by `/dev/ttyACM0`.** With two devices the numbers are not fixed:
+  ```
+  tty_of() { python3 -c "import sys;from serial.tools import list_ports;print([q.device for q in list_ports.comports() if (q.vid,q.pid)==(int(sys.argv[1],16),int(sys.argv[2],16))][0])" "$1" "$2"; }
+  ```
+  `tty_of 04d8 00df` is the ECG module and `tty_of 0483 5740` the board. This opens nothing.
+- **"Listen"** is E1's listen command, which already finds the port by VID:PID and sets `inter_byte_timeout = 0.05`. Never drop that line: without it, Chrome reports "The device has been lost". Follow it with `stty -F "$(tty_of 04d8 00df)" -a | grep -o 'min = [0-9]*; time = [0-9]*'`, which must print `min = 1; time = 0`. No page may hold the port during a listen.
+- **After any plug-in,** wait 10 s, then until `fuser` on that port prints nothing, because ModemManager may probe it.
+- **Serving, from the repo root:** `python3 -m http.server -b 127.0.0.1 -d Projects/WeAct_MiniH750/Applications/USB_Device/PCG_CDC/Web 8001`. Never touch port 8000. Always `localhost`, not `127.0.0.1`, because port grants belong to the origin. Hard-reload with Ctrl+Shift+R after any code change.
+- **Anything recorded from a person is health data:** never in the repo, never a fixture, and deleted after use. The tester reports only the loader's summary.
+- **The sensors stay on the body.** The piezo is fitted under a bandage and refitting it is difficult, so no step removes or moves it, and the electrodes stay stuck on. Steps disconnect a connector or a USB cable instead.
+- Physical checks pass only when the user confirms them. Do not commit.
+
+- [x] S1. **Tester first: what is attached (no port opened, no code).** From the repo root:
+  ```
+  lsusb | grep -E '0483:5740|04d8:00df'
+  for d in /sys/class/tty/ttyACM*; do t=${d##*/}; u=$(readlink -f "$d/device/.."); echo "$t $(cat "$u/idVendor"):$(cat "$u/idProduct") holders: [$(fuser "/dev/$t" 2>/dev/null)]"; done
+  ss -ltn | grep -E ':800[01] '
+  ls -l ../stm32h7_blinkled_vscode/GPIO_IOToggle_Led/backup/weact_factory_internal_flash.bin
+  openocd -f openocd.cfg -c "init" -c "exit"
+  ```
+  **Acceptance:** both devices are listed, each on its own `ttyACM`, with empty holders. Report which is which, and anything on 8001. Port 8000 belongs to `strategy_app.py`: report it, leave it. The backup is 131072 bytes. OpenOCD prints `processor detected`. If a port has a holder, or the board shows no `0483:5740`, stop and report: do not kill anything, and do not flash.
+  **Result (2026-11-04):** `/dev/ttyACM0` is the STM32 board and `/dev/ttyACM1` the ECG module (MCP2200 serial `0001671253`). 8001 is free. The factory backup is present, 131072 B. The user ran `openocd -f openocd.cfg -c "init" -c "exit"` themselves, because the permission system refused it for the tester: `SWD DPIDR 0x6ba02477`, `[stm32h7x.cpu0] Cortex-M7 r1p1 processor detected`.
+
+- [x] S2. **Firmware: keep every 48th filtered sample (no device).** Files: `Inc/pcg_filter.h`, `Src/pcg_filter.c`, `Src/main.c`, `Tests/pcg_filter_test.c`.
+  **Result (2026-11-04):** host test seven lines `ok`, exit 0, 600 Hz at −38.189 dB and 800 Hz at −48.145 dB. Build has no errors, `arm-none-eabi-size` gives text 33264, data 384, bss 10440, so `text + data` = 33648 < 131072. `no pin or clock change` printed. Not flashed: S8 does that.
+  - **`pcg_filter.h`:** add `#define PCG_DECIMATE 48 /* 48 kHz in, 1000 Hz out */`. The comment says that `pcg_filter` band-passes `n` raw counts at 48 kHz, writes every `PCG_DECIMATE`-th result to `out`, so `n / PCG_DECIMATE` values, and that `n` must be a multiple of `PCG_DECIMATE`.
+  - **`pcg_filter.c`:** after the biquad loop, `if (i % PCG_DECIMATE != 0) continue; /* keeps samples 0, 48, ... of each block */`. The last line becomes `*out++ = …`.
+  - **`main.c`:** the header comment gives the new frame. `HALF` stays 480, its comment becomes "samples per DMA half: 10 ms at 48 kHz". Add `#define FRAME_SAMPLES (HALF / PCG_DECIMATE) /* 10 samples at 1000 Hz */`, and `frame[2 + FRAME_SAMPLES]`. The `pcg_filter(…, &frame[2], HALF)` call stays.
+  - **`pcg_filter_test.c`:** the sum loop runs to `BLOCK / PCG_DECIMATE`, and the gain uses `sqrt(sum / (FS / PCG_DECIMATE))`. Every `-1e9` becomes `-INFINITY`, because the 2 kHz tone folds onto DC at a zero crossing, so its output is exact zeros, −inf dB, which `-1e9` rejects (the planner's dry-run hit this). Add `{600, -39, -37}` and `{800, -49, -47}`. Do not add 500 or 1000 Hz: they fold to Nyquist and DC, where the RMS depends on the phase.
+
+  **Acceptance:**
+  ```
+  gcc -O2 -Wall -IInc Src/pcg_filter.c Tests/pcg_filter_test.c -lm -o "$S/pcg_filter_test" && "$S/pcg_filter_test"
+  cmake --preset Debug && cmake --build --preset Debug
+  arm-none-eabi-size build/Debug/PCG_CDC.elf
+  ! git diff -U0 -- Src Inc | grep -E '^[-+].*(GPIO|PA1[34]|RCC_)' && echo no pin or clock change
+  ```
+  Seven lines ending `ok`, exit 0, with 600 Hz at −38.19 and 800 Hz at −48.15 dB (planner's dry-run). No build errors, `text + data < 131072`, then `no pin or clock change`.
+
+- [x] S3. **PCG browser code for 24-byte frames (no device).** Files: `Web/pcg_parser.js`, `Tests/pcg_parser_test.mjs`, `Web/upsample.js` (new), `Tests/upsample_test.mjs` (new), `Web/index.html`.
+  **Result (2026-11-04):** `pcg_parser_test` pass 10, `upsample_test` pass 5, `pcg_audio_test` pass 11, all fail 0, then `audio player unchanged`, `page syntax OK` and `index rates OK`. The Connect guard copied from `ecg.html` also went in, approved by the user on 2026-11-04, so it replaces "Leave the Connect race alone" below: the button is disabled for the whole attempt, and `finally` re-enables it and restores focus. No `opened` flag, because nothing can throw after `open` here and the `catch` closes nothing. Checked by running the page's script under stubs, not in Chrome, so a double-click on Connect is still a user check to add at S9.
+  - **`pcg_parser.js`:** `FRAME_BYTES = 24`, `SAMPLES_PER_FRAME = 10`, add `export const RATE = 1000;`, update the header comment. The parser logic stays byte-identical.
+  - **`pcg_parser_test.mjs`:** only these replacements. The planner's dry-run with them passes 10/10:
+
+    | Old | New |
+    |---|---|
+    | `FRAME_BYTES - 836`, and the title's "(the 836-byte fragment the tester saw)" | `FRAME_BYTES - 14`, title without it |
+    | "964 bytes later" (test title and comment) | "24 bytes later" |
+    | `frame(0).subarray(300)` | `frame(0).subarray(7)` |
+    | `[963, 964, 965][k % 3]`, `rnd(2001)` | `[23, 24, 25][k % 3]`, `rnd(51)` |
+    | `frame(2).subarray(0, 500)` | `frame(2).subarray(0, 12)` |
+    | `j === 100`, `101`, `102`, and "Samples 100 and 101", "sample 102 = 3" | `j === 4`, `5`, `6`, and the same in the comment |
+    | `frame(0, fill).subarray(100)`, `f(0).subarray(100)` | `.subarray(8)` |
+
+  - **`upsample.js`:** `createUpsampler(L)` returns `(x) => array`. The first call returns `[x]`. Later calls return the `L` points `prev + (x − prev)·i/L` for `i = 1…L`, so the last one is exactly `x`. Comment: the first sample gives one output and each later one gives L, and no output waits for a later input.
+  - **`upsample_test.mjs`, `node:test`:**
+    1. **Count:** N inputs give 2N − 1 outputs at L = 2 and 1 + 48(N − 1) at L = 48.
+    2. **Fixed map at L = 2:** `y[2m] === x[m]` exactly, and `y[2m+1] === (x[m] + x[m+1]) / 2`.
+    3. **Constant and ramp:** a constant stays exact, and a ramp `a + b·m` gives `a + b·j/2` within 1e-9.
+    4. **40 Hz:** a unit sine at 500 Hz for 10 s, against the true sine at `j` ms. Largest error between 0.030 and 0.0315, RMS ≤ 0.0160, zero error on even `j`. Planner's prototype: 0.03141.
+    5. **Audio use:** 10-sample frames at L = 48 give 480 outputs per frame after the first.
+  - **`index.html`:**
+    - `import { createParser, RATE } from './pcg_parser.js';` and `import { createUpsampler } from './upsample.js';`.
+    - `const RING = 5 * RATE; // 5 s, a whole number of 10-sample frames, so ring.set never wraps`.
+    - **`draw()` inner loop, a trap:** the ring is now narrower than a wide canvas, and an empty column would plot ±32767. Use the guard `ecg.html` has: `e = Math.max(k + 1, Math.floor(((x + 1) * RING) / W))`, with its comment.
+    - **Audio:** `const up = createUpsampler(48);`. The read loop's post becomes `if (frames++ > 0 && audioNode) audioNode.port.postMessage(Int16Array.from(Array.from(s).flatMap((v) => up(v))));`. One comment: the player runs at 48 kHz and cannot run at 1 kHz.
+    - **In `startAudio()`:** `node.connect(new BiquadFilterNode(actx, { type: 'lowpass', frequency: 300, Q: -3 })).connect(actx.destination);` replaces `node.connect(actx.destination);`. One comment: it removes the interpolator's images near 1 kHz, where the ear is most sensitive.
+    - **Caption:** "PA6 sampled at 48 kHz, band-passed 20–200 Hz and reduced to 1000 samples/s on the board. Last 5 s, newest on the right. The vertical scale fits the largest sample in view (mV = counts × 3300 / 65536)."
+    - **Connect fix:** went in with S3, the same guard as `ecg.html` (user decision, 2026-11-04).
+
+  **Acceptance:**
+  ```
+  node Tests/pcg_parser_test.mjs; node Tests/upsample_test.mjs; node Tests/pcg_audio_test.mjs
+  git diff --quiet HEAD -- Web/pcg_audio.js Tests/pcg_audio_test.mjs && echo audio player unchanged
+  python3 -c "import re;print(re.search(r'<script type=\"module\">(.*?)</script>',open('Web/index.html').read(),re.S).group(1))" > "$S/pcg_page.mjs" && node --check "$S/pcg_page.mjs" && echo page syntax OK
+  grep -qF "Math.max(k + 1" Web/index.html && grep -qF "BiquadFilterNode" Web/index.html && ! grep -qE "48000;|48 kHz\. L" Web/index.html && grep -qF "sampleRate: 48000" Web/index.html && echo index rates OK
+  ```
+  The three test files end with `fail 0` (`pass 10`, `pass 5`, `pass 11`), then the three OK lines.
+
+- [x] S4. **Share the ECG commands (no device, behaviour unchanged).** Files: `Web/ecg_dsp.js`, `Web/ecg.html`, `Tests/ecg_dsp_test.mjs`.
+  **Result (2026-11-04):** `ecg_dsp_test` pass 10, fail 0, then `page syntax OK`, `commands shared` and `0`. Under a stubbed port on a virtual clock, `HEAD` and the moved code gave identical traces over 11 scenarios (298 lines: bytes, waits, writer lock, `writable.close`, keep-alive frame counts), and all 14 injected breaks changed the trace. Not run on the module: S9 does that.
+  - **`ecg_dsp.js`** gains, with the comments moved from `ecg.html`:
+    ```
+    export const START = [[0x02], 100, [0x02], 100, [0x01], 100, [0x01], 5, [0x09]];
+    export const KEEP_ALIVE = [[0x09], 5, [0x09]];
+    export const STOP = [[0x02], 100, [0x02]];
+    export const KEEP_ALIVE_FRAMES = 30000;
+    export function createSender(port) { … }
+    ```
+    `createSender` returns `send(...steps)`, the body of today's `send()` moved verbatim, with `writes` now one chain per port and `p` now `port`. Everything from `FRAME_BYTES` to the end of the filters stays byte-identical.
+  - **`ecg.html`:** remove `send()` and `writes`. Add `let send = null;`, and `send = createSender(p);` next to `port = p;`. The three call sites become `send(...START)`, `send(...KEEP_ALIVE)` with `keepAliveAt += KEEP_ALIVE_FRAMES` and its initial value, and `send(...STOP).then(() => p.writable.close()).catch(() => {})`. Nothing else changes.
+  - **`ecg_dsp_test.mjs`:** tests 1–9 stay. Add test 10, "commands go out one byte per write, in order": a stub port whose writer records each write and when. `send(...START)` writes five single bytes `02 02 01 01 09`, with gaps of at least 95 ms, 95 ms, 95 ms and 4 ms. A `send(...STOP)` queued during it starts only after the `09`. A writer that throws does not break the chain, and the next `send` still writes.
+
+  **Acceptance:**
+  ```
+  node Tests/ecg_dsp_test.mjs
+  python3 -c "import re;print(re.search(r'<script type=\"module\">(.*?)</script>',open('Web/ecg.html').read(),re.S).group(1))" > "$S/ecg_page.mjs" && node --check "$S/ecg_page.mjs" && echo page syntax OK
+  python3 -c "s=open('Web/ecg.html').read(); [s.index(x) for x in ('createSender(p)','send(...START)','send(...KEEP_ALIVE)','send(...STOP)','p.writable.close()')]; assert '0x02' not in s and '0x09' not in s; print('commands shared')"
+  git diff -U0 -- Web/ecg_dsp.js | grep -E '^-[^-]' | wc -l
+  ```
+  `pass 10`, `fail 0`, `page syntax OK`, `commands shared`, and `0` (nothing removed from `ecg_dsp.js`). The older E4 and E7 static checks on `ecg.html` fail by design, because they look for the literal sequence: do not rerun them. S9 re-proves the bytes on the module.
+
+- [x] S5. **`Web/recorder.js` and its self-check (no device).** Files: `Web/recorder.js` (new), `Tests/recorder_test.mjs` (new). Constants: `PCG = 1, ECG = 2, EVENT = 3, ECG_1K = 4`, `HEADER_BYTES = 13`, `SEGMENT_BYTES = 256 * 1024`, `ECG_PORT`, `PCG_PORT` (the `{ usbVendorId, usbProductId }` filters), `ALIGN_NOTE` (Decisions).
+  **Result (2026-11-04):** `node Tests/recorder_test.mjs` pass 11, fail 0, on synthetic data only, and all 28 injected breaks failed a test. In a separate synthetic session, every gap was recovered from the saved bytes alone: 2 dropped PCG frames by `seq`, 17 lost ECG bytes as a marker hunt, `read-error`, `lost`, and a deleted file as a numbering hole. Not run in Chrome or on the devices.
+  - **`record(kind, t, bytes)`** returns the header plus payload of one record.
+  - **`createLog(save)`:** `save(index, blob)` is async.
+    - `add(t, ...[kind, bytes])` appends one group. A group is never split across files, so a kind 2 record and its kind 4 record stay together.
+    - When the open segment reaches `SEGMENT_BYTES`, it is queued and written, one at a time, in order.
+    - `event(t, object)` adds a kind 3 record.
+    - `flush()` queues the rest and resolves `true` once everything is saved.
+    - A failed save stays at the head of the queue, sets `stats.error` and is retried at the next roll or flush. `stats` also holds `saved` and `unsaved`.
+    - Comment: `shortcut: unsaved segments stay in memory with no cap, 100-200 MB per hour of failed writes; add a cap if disks ever fill mid-recording`.
+  - **`createEcgChain()`:** `createParser()`, `createEcgFilter()` and `createUpsampler(2)` for lead II. `push(chunk)` returns a `Float32Array` of the new 1000 Hz samples. `stats` is the parser's, plus `skippedAfterLock`.
+  - **`leadIILine({ raOff, llOff })`:** exactly `RA and LL electrodes on.`, `Lead II not valid: RA electrode off.`, `Lead II not valid: LL electrode off.`, `Lead II not valid: RA and LL electrodes off.`. LA is not part of lead II.
+  - **`findPorts(ports)`:** returns `{ ecg, pcg }` by `getInfo()`, `null` where absent, in any order.
+  - **`readPort(dev, now, onChunk, onError)`:** the read loop from `ecg.html`, with `dev = { port, reader, stopping }`, and **`const t = now();` the first line after `await reader.read()`**. Non-fatal errors call `onError` and the outer loop resumes. It closes the port and returns the error text, or `''` after a Stop.
+  - **`startSession({ ecgPort, pcgPort, log, now, onPcg, onEcg, onLost })`** returns `{ stop, done }`.
+    - Writes the `start` event, starts both `readPort` loops in the same tick, then `await send(...START)` and the `ecg-start-sent` event.
+    - **PCG chunk:** `log.add(t, [PCG, value])`, then parse, `onPcg(frames)`.
+    - **ECG chunk:** `y = chain.push(value)`, then `log.add(t, [ECG, value], [ECG_1K, bytes of y])`, `onEcg(y)`. Keep-alive counted, as in `ecg.html`, with a `keep-alive` event.
+    - **A stream ending without Stop:** `lost` event, `onLost(name, message)`, `log.flush()`. Both lost: the session ends itself, and `done` resolves after the final flush.
+    - **`stop()`:** no keep-alive follows. `await send(...STOP).then(() => ecg.port.writable.close()).catch(() => {});`, both `stopping = true`, cancel both readers, await both loops, `stop` event, `await log.flush()`. PCG keeps logging until the ECG stop is drained.
+
+  **Test, `node:test`, synthetic only, with fake ports built on web streams and an injected `now`:**
+  1. **Record layout:** f64 at 0, u32 at 8, u8 at 12, payload at 13, little-endian.
+  2. **Segments:** every file starts and ends on a record boundary, a group is never split, numbering runs 1, 2, 3, and the concatenation equals all records in order.
+  3. **Failed save:** `save` rejects twice, then works. Nothing is lost or reordered, `flush()` gives `false` then `true`, and `stats.error` is set then cleared.
+  4. **`createEcgChain`, chunk independence:** one output for any chunking (1 byte, 41 bytes, random, whole buffer), identical to the sample. Count 2F − 1 for F frames. `y[2m]` equals `Math.fround` of a separate `createEcgFilter()` run on lead II. `skippedAfterLock` counts only bytes lost after the first frame, not the start-up junk.
+  5. **`leadIILine`:** the four texts, and an LA flag changes nothing.
+  6. **`findPorts`:** either order, a foreign port ignored, `null` when absent.
+  7. **Normal session:** the ECG port receives exactly `START`, then `STOP`, then its writable closes, and only then are the readers cancelled. Chunks logged before and during the stop are all present, and `stop` is the last record.
+  8. **Keep-alive:** counted at 30 000 frames, none after Stop.
+  9. **One device lost:** the ECG stream errors with `readable` null. `lost` is logged once, PCG keeps logging, and Stop still resolves without throwing, with no writes to the dead port.
+  10. **Non-fatal read error:** the stream errors, a new `readable` appears, reading resumes, and a `read-error` event sits between the two runs of records.
+  11. **Both lost:** `done` resolves with everything saved, with no Stop.
+
+  **Acceptance:** `node Tests/recorder_test.mjs` ends with `pass 11`, `fail 0`.
+
+- [ ] S6. **`Tools/load_recording.py` and the round trip (no device).** Files: `Tools/load_recording.py` (new), `Tests/recorder_test.mjs` (extended).
+  - **`load(folder)`** returns a dict, and never raises on a damaged recording:
+
+    | Key | Type | Meaning |
+    |---|---|---|
+    | `pcg` | int16[N] | Samples as sent, stale first frame removed, STM32 clock |
+    | `pcg_index` | int64[N] | `10·unwrapped_seq + k`, from the first live frame. Jumps across a drop |
+    | `pcg_frame_index`, `pcg_frame_t` | int64, float64 per frame | Index of the frame's first sample, and `t` of the chunk that completed it |
+    | `ecg_i`, `ecg_ii` | int16[M] | Raw counts per frame, module clock |
+    | `ecg_a1`, `ecg_b1` | uint8[M] | Status bytes (protocol §8.3) |
+    | `ecg_frame_t` | float64[M] | `t` of the chunk that completed each frame |
+    | `ecg_1k` | float32[2M − 1] | Filtered, upsampled lead II. `ecg_1k[2m]` is frame `m` |
+    | `ecg_resync` | list of (frame, bytes) | Each marker hunt after lock |
+    | `pcg_drops` | int | Frames missing by `seq` |
+    | `events` | list of (t, dict) | All events |
+    | `missing_segments`, `errors` | lists | Gaps in file numbering, a record that overruns its file |
+
+    The parsers copy the rules of `createParser` in `pcg_parser.js` and `ecg_dsp.js`.
+  - **`summary(rec)`,** printed by `python3 -I Tools/load_recording.py <folder> [--json]`. It holds no samples: `note`, `seconds`, `segments`, `missing_segments`, `errors`, `pcg_frames`, `pcg_drops`, `ecg_frames`, `ecg_resyncs`, `ecg_skipped_after_lock`, `ecg_1k_ok` (`len == 2M − 1`), `lost`, `read_errors`, `keep_alives`, `pcg_hz`, `ecg_frame_hz`, `relative_ppm`, `relative_ppm_halves`, `residual_ms` (p50, p99, max per stream), `chunk_bytes` (median, max per stream).
+    - `pcg_hz` and `ecg_frame_hz` come from `np.polyfit` of index against `t`, from 3 s after `ecg-start-sent`, using the longest ECG run between resyncs.
+    - `relative_ppm` is `(ecg_frame_hz/500) / (pcg_hz/1000) − 1` in ppm.
+    - The module docstring carries the format, the note that this fit is a report, not a correction, and that the fixed offset between the ECG and PCG paths is an unmeasured estimate of about ±3 ms.
+  - **Round-trip test:** a 300 s synthetic recording, built through the real `createLog` and `createEcgChain` into `fs.mkdtemp`, and removed afterwards.
+    - **Clocks:** PCG +20 ppm, ECG +240 ppm, seeded one-sided jitter.
+    - **Contents:** a stale first frame, `seq` starting near 32 000 so it wraps, 2 dropped frames, ECG junk before lock, 17 bytes lost mid-stream, chunks cut mid-frame, and events.
+    - **Run:** the test calls Python with `Tools` on `sys.path`, dumps the arrays with `.tofile()` into the temp folder, and compares them with what it generated, byte for byte. It also reads `--json`.
+    - **Assert:** exact equality of `pcg`, `pcg_index`, `ecg_i`, `ecg_ii`, `ecg_1k`; `pcg_drops` 2; `ecg_resyncs` 1, with the right frame and bytes; `ecg_1k_ok`; `relative_ppm` within 220 ± 2; `note` equal to `ALIGN_NOTE`.
+    - **Damage:** a deleted middle file appears in `missing_segments`, and a truncated last file appears in `errors`. Neither raises.
+
+  **Acceptance:** `node Tests/recorder_test.mjs` ends with `fail 0` and at least `pass 13`, and `git status --porcelain | grep -c ecgpcg` prints `0`.
+
+- [ ] S7. **The page, `.gitignore` and the documents (no device).** Files: `Web/recorder.html` (new), `.gitignore`, `P/README.md`, `Acquisition_systems_summary.md`, `ECG_viewer_status.md`.
+  - **`recorder.html`, built from `ecg.html`'s markup and styles:**
+    - Title and `<h1>` "ECG and PCG recorder". Buttons `allow` (Allow device) and `start` (Start, toggling to Stop).
+    - `role="status"` lines: `devices`, `msg`, `leads`, `warn`. Numbers in a plain `stats` span.
+    - Two `<h2>` + canvas pairs, `traceEcg` and `tracePcg`, 34vh each, labelled as in `ecg.html`.
+    - **The caption gives:** ECG lead II with the forward-only filters, upsampled to 1000 Hz by linear interpolation; PCG band-passed 20–200 Hz and reduced to 1000 Hz on the board; last 5 s, newest on the right; then `ALIGN_NOTE`, which the script sets on an element with `textContent`, so there is one copy of it.
+    - The start-up message and the "no Web Serial" message use port 8001. Add `'showDirectoryPicker' in window` to the capability check.
+  - **Script behaviour:**
+    - `refresh()` runs at load and on `navigator.serial` `connect` and `disconnect`: `findPorts(await getPorts())`, sets `devices`, and enables Start when both are present and nothing is recording.
+    - **Allow device:** `requestPort({ filters: [ECG_PORT, PCG_PORT] })`, then `refresh()`, guarded and with focus restored as in `ecg.html`. Cancelling says so.
+    - **Start:** button disabled. `dir ??= await showDirectoryPicker({ id: 'ecgpcg', mode: 'readwrite', startIn: 'documents' })` first, because it needs the click. Then `findPorts` again, `getDirectoryHandle('ecgpcg-YYYYMMDD-HHMMSS', { create: true })`, open PCG `{ baudRate: 115200, bufferSize: 65536 }`, open ECG `{ baudRate: 230400, bufferSize: 65536 }`, `setSignals({ dataTerminalReady: false, requestToSend: false })`.
+    - **On any failure:** close only the ports opened in this attempt. `msg` says `Not started: <device>: <message>`, and hints that another page may hold the port.
+    - **`save(index, blob)`:** `getFileHandle`, `createWritable`, `write`, `close`, and `abort` on failure. One comment: only `close()` puts the data in the named file, which is why each segment is its own file.
+    - **Traces:** two `Float32Array(5000)` rings with their own `written`. ECG takes `y` from `onEcg`. PCG takes `counts × 3300 / 65536`. `MIN_FULL` is 50 for both. `draw(t)` is copied from `ecg.html`, plus `t.unit`.
+    - **Each second:** `stats` shows ECG frames/s, PCG samples/s, PCG dropped frames, ECG bytes lost after lock, recording length m:ss, files saved, both scales.
+    - **`warn`,** written only when its text changes, shows every true case: no ECG frames, or no PCG samples, for over 3 s while recording; a `lost` device, which stays until the next Start; `stats.error` from saving.
+    - **`leads`** comes from `leadIILine`, written only when it changes.
+    - **After Stop or a self-ended session:** if `flush()` is `false`, the button reads Retry save and calls `flush()` again. Otherwise `msg` is `Saved <m:ss> in <folder> (<n> files). <ALIGN_NOTE>`.
+    - **`beforeunload`:** `preventDefault()` while recording or while unsaved data remains.
+  - **`.gitignore`:** a comment, "Recordings are health data", and `ecgpcg-*/`.
+  - **`P/README.md`:**
+    - Update the header paragraphs (48 kHz sampling, 1000 Hz output, 24-byte frame, sample index from `seq`), the wire format and the "Browser viewer" paragraph.
+    - Add a section "Synchronized recorder": what Start does, the `ALIGN_NOTE` text, how to serve it on 8001, the format tables, the loader, and the offline recipe:
+      1. Fit `t = a + b·n` per stream, skipping the first 3 s and splitting at `ecg_resync` and `lost`.
+      2. `pcg_index` and `j/2` give each sample's host time.
+      3. Resample one stream onto the other.
+      4. Allow for the filter delays in Decisions.
+      5. Say that the fixed offset between the two paths stays an unmeasured estimate of about ±3 ms.
+    - Say that stored lead II is distorted in T and ST and delayed about 10 ms at the QRS, and that the raw counts are not.
+    - Say that a crash can leave a `.crswap` file, which is also health data.
+  - **`Acquisition_systems_summary.md`:** PCG lines 13–18 (ADC still 48 kHz, 1000 Hz out, about 2.4 KB/s, 24-byte frame, 10 samples), and a short "Recorder" section, which says that the fixed path offset is an unmeasured estimate of about ±3 ms. Drop its "Known bug" line about the double click on Connect, fixed in S3.
+  - **`ECG_viewer_status.md`:** drop the double-Connect reminder at the end, fixed in S3.
+
+  **Acceptance:**
+  ```
+  python3 -c "import re;print(re.search(r'<script type=\"module\">(.*?)</script>',open('Web/recorder.html').read(),re.S).group(1))" > "$S/rec_page.mjs" && node --check "$S/rec_page.mjs" && echo page syntax OK
+  for t in pcg_parser upsample pcg_audio ecg_dsp recorder; do node Tests/${t}_test.mjs | grep -E '^ℹ (pass|fail)'; done
+  git -C ../../../../.. check-ignore -q ecgpcg-20261104-120000/00001.ecgpcg && echo recordings ignored
+  grep -q '1000' README.md && ! grep -qE '964|96 ?KB|480 filtered' README.md ../../../../../Acquisition_systems_summary.md && echo documents updated
+  python3 -m http.server -b 127.0.0.1 -d Web 8001 >/dev/null 2>&1 & W=$!; sleep 1; for f in recorder.html recorder.js upsample.js ecg.html index.html ecg_dsp.js pcg_parser.js pcg_audio.js; do curl -s -o /dev/null -w "%{http_code} %{content_type} /$f\n" "http://localhost:8001/$f"; done; kill $W
+  ```
+  Check port 8001 is free first (S1). It must print `page syntax OK`, five `fail 0` lines, `recordings ignored`, `documents updated`, and eight `200` lines. Also run the `Web/` tree through `git status --short`: only the listed files appear.
+
+- [ ] S8. **Flash the decimating firmware (tester, stop-and-ask).** No code changes. From the repo root, with `P` as above.
+  1. **Pre-flash checks, nothing written:**
+     ```
+     ls -l ../stm32h7_blinkled_vscode/GPIO_IOToggle_Led/backup/weact_factory_internal_flash.bin
+     openocd -f openocd.cfg -c "init" -c "exit"
+     arm-none-eabi-size $P/build/Debug/PCG_CDC.elf
+     fuser "$(tty_of 0483 5740)"
+     ```
+     Backup 131072 bytes, `processor detected`, `text + data < 131072`, and `fuser` prints nothing. Close any page holding the board.
+  2. **STOP. Do not flash yet.** Report these results, then ask the user to disconnect, not to remove anything. Nothing on the body may be connected to the board or the module during the flash, but the sensor stays under its bandage and the electrodes stay stuck on. The user:
+     - Unplugs the wire from the PCG PCB's filter output to PA6, with its ground wire if there is one, or else the piezo from its PCB, whichever connector exists.
+     - Unplugs the ECG lead cable from the module, or unclips the leads.
+
+     Flash only when the main session relays that the user has done both and says go. **If the wiring has no such connector for either one, stop here, say which, and ask.** Do not assume, and do not flash. The USB cables and the Atmel-ICE stay connected.
+  3. **Flash, with `verify` only:**
+     ```
+     openocd -f openocd.cfg -c "program $P/build/Debug/PCG_CDC.elf verify reset exit"
+     ```
+     It must print `** Verified OK **`. Never `unlock`, mass erase or an option-byte command. PA13/PA14 are not reconfigured, and nothing new is connected to PA6: it stays open here and goes back to the PCG PCB's filter output in S9.
+  4. **Stream check, still disconnected.** Wait for ModemManager (Rules), then:
+     ```
+     T=$(tty_of 0483 5740); stty -F "$T" raw -echo && timeout 5 cat "$T" > "$S/pcg.bin"; python3 -c "import sys;d=open(sys.argv[1],'rb').read();s=b'\x00\x80';i=next(i for i in range(len(d)) if all(d[i+k*24:i+k*24+2]==s for k in range(4)));f=[d[j:j+24] for j in range(i,len(d)-23,24)];print(len(d)/5,all(x[:2]==s for x in f),{(int.from_bytes(b[2:4],'little')-int.from_bytes(a[2:4],'little'))%32768 for a,b in zip(f[1:],f[2:])})" "$S/pcg.bin"; rm "$S/pcg.bin"
+     ```
+     **Acceptance:** `Verified OK`, then 2352–2448 B/s (2400 ± 2 %), `True` and `{1}`. The first frame is skipped for the seq check, because it is the stale one.
+
+  **If anything fails:** stop and report, with no second attempt and no erase. Rollback is the same procedure with the firmware built from `HEAD`.
+
+- [ ] S9. **The old viewers on the new firmware (user and tester).** The user reconnects what S8 disconnected, ground before signal, and says go. Serve on 8001 (Rules).
+  1. **`http://localhost:8001/` (Connect, pick "WeAct H750 PCG"):** about 1000 samples/s, drops stay 0, the heart sounds look as before, slightly coarser. Disconnect. The user confirms.
+  2. **`http://localhost:8001/ecg.html`:** within 3 s about 500 frames/s and both leads, and "Disconnected." after Disconnect. **Tester:** listen under 1000 bytes. This re-proves S4's moved commands.
+  3. **Audio, a quick look only:** Start audio works and plays at low volume. The full check stays in step 6c, for the user.
+  4. **The Connect fix from S3, on `http://localhost:8001/`:** double-click Connect in Chrome. One chooser opens, no "already open" message appears, and keyboard focus is still on the button.
+
+  **Acceptance:** the user confirms 1–4, and the listen passes. If `ecg.html` misbehaves, stop before S10: the module's bytes come first.
+
+- [ ] S10. **First recording, 2 minutes (user and tester).**
+  1. **User:** open `http://localhost:8001/recorder.html`. Allow device twice if asked. Start, and in the folder dialog make a new folder outside the repo, for example `~/Documents/ecg_pcg_recordings`. Both traces appear within about 3 s, ECG settles in about 2 s, and the line reads "RA and LL electrodes on.". Report it if the tab looks slow, or Chrome's task manager shows above about 20 % CPU. After 2 minutes or more, click Stop.
+  2. **User:** tell the tester the recording's folder.
+  3. **Tester:** `python3 -I Tools/load_recording.py "<folder>"` and report the whole summary. It holds no samples.
+
+  **Acceptance:** the user confirms item 1, and the summary shows these counts for 2 minutes, scaled if the recording ran longer:
+  - `errors`, `missing_segments`, `lost` and `read_errors` empty.
+  - `pcg_frames` 11 800–12 200, `pcg_drops` 0.
+  - `ecg_frames` 59 000–61 000, `ecg_resyncs` 0, `ecg_skipped_after_lock` 0, `ecg_1k_ok` true.
+  - `keep_alives` at least 1.
+  - `|relative_ppm|` under 1000.
+  - `residual_ms` p99 under 20 for both.
+  - Listen under 1000 bytes.
+
+  **Measured here, and recorded in the result line:** real chunk sizes, residuals and `relative_ppm`, to replace the model in the alignment budget. If p99 is over 20 ms, or anything else fails, report it to the planner: moving the read loops into a worker is the known fallback. The tester deletes this recording once the user agrees, unless the user keeps it as a first real recording.
+
+- [ ] S11. **Failure drills (user and tester).** Each is a short recording, about 30 s, and each folder is deleted afterwards. A drill may disconnect a USB cable, never a sensor from the body.
+  1. **Unplug the board's USB-C while recording.** Before Start, take the PCG PCB's signal wire off PA6, because the PCB stays live on its battery while the board has no power (Decisions). Put it back only after USB is back. Within about 3 s `warn` names the PCG board and stays, and the ECG trace keeps moving. Stop. "Saved …". The summary shows `lost` for PCG and ECG frames continuing past that time. Replug and wait (Rules).
+  2. **Unplug the ECG module's USB cable while recording,** not its lead cable. The same, the other way round. Replug and wait.
+  3. **Kill the tab while recording:** Shift+Esc, select the tab, End process. The folder still holds the earlier files. The summary shows empty `errors` and a length within 10 s of the elapsed time. **Tester:** listen about 40 000 bytes (module left streaming). Reload and Start: frames within 3 s, then Stop, and listen under 1000 bytes.
+  4. **Try to close the tab while recording.** Chrome asks first. Cancel, and the recording continues.
+  5. **Open `ecg.html`, Connect, then Start in the recorder.** `Not started: ECG module: …`, and `fuser` on the board's port prints nothing, so the PCG port was not left open. Disconnect `ecg.html`.
+
+  **Acceptance:** the user confirms 1–5, and the tester reports each summary and listen.
+
+- [ ] S12. **A long recording (user).** Record at least 10 minutes, past nine keep-alives, doing what the real use will be, with the tab in view.
+
+  **Acceptance:** as S10, scaled to the length. `relative_ppm_halves` differ by under 5 ppm, so a straight line per recording is enough. If not, tell the user that a piecewise fit is needed. The user tries the offline correction with the loader's arrays and says whether the file has what they need. This recording is the user's to keep or delete.
+
+## Not doing
+
+- **Alignment on the page:** drift correction, resampling to a common clock, any automatic alignment (the user does it offline).
+- **Firmware:** a start/stop command, a wider counter, averaging before decimation, host pings, a hardware trigger, any way to get 48 kHz or unfiltered PCG out of the board.
+- **Recording:** an in-memory or single-file mode, a format option, pause, a recording list, compression, a worker for the read loops (the fallback if S10 demands it), a screen wake lock.
+- **Page:** audio, a lead I trace, a preview before Start, a sample-aligned display, auto-reconnect, settings.
+- **ECG:** a better interpolator than linear, filter changes.
+- **Loader:** plotting, the drift correction itself, a re-implementation of the §12 chain.
+- **Tap calibration:** dropped by the user on 2026-11-04, because refitting the piezo under the bandage is impractical. `Tools/tap_offset.py` is not written, and the fixed path offset stays an unmeasured estimate of about ±3 ms.
+- **Other pages:** the stale "port 8000" text in `index.html`, `ecg.html` and the README's older sections. The `index.html` Connect fix is no longer on this list: it went in with S3 (user decision, 2026-11-04).
+- **Checks skipped after the flash:** step 4b's register dump and 4c's ADC read, because clocks and ADC are unchanged and the stream check covers them.
+- **Cleanup:** deleting the F1 tree, and editing the two older plan sections.
+
+## Needs the user
+
+- **Before S8:** do not take anything off your body. The sensor stays under its bandage and the electrodes stay stuck on. Unplug the wire from the PCG PCB's filter output to PA6, with its ground wire if there is one, or else the piezo from its PCB, and unplug the ECG lead cable from the module or unclip the leads. Keep USB and the Atmel-ICE connected, then say go. If there is no such connector, say so. Reconnect after the flash, ground before signal, and say go for S9.
+- **Keep the PC awake during a recording.** Sleep would drop both ports. If it is a laptop, run it on a charged battery with the charger unplugged, because the body is connected to the PC through USB. Keep the tab in view: drawing stops in a hidden tab, and recording does not.
+- **Always use Stop.** A killed or crashed tab loses the last 5–9 s and leaves the module streaming until the next Start.
+- **Your recordings are health data.** Keep them outside the repo, in a folder you make in the Start dialog. Chrome may refuse `~/Documents` itself, so make a subfolder. Delete any `.crswap` file a crash leaves.
+- **No wire between the ECG side and the STM32.** Both are on the body through their own sensors, and this plan adds no link between them.
+- **You should know, no action needed:**
+  - After the flash, the PC never receives 48 kHz PCG again. Above 200 Hz, the 1000 Hz signal is only filter skirt and alias.
+  - Same rate does not mean paired. Sample `j` of ECG and of PCG are not simultaneous, by about 14 ms per minute at E1's rate, until you correct them.
+  - Stored 1000 Hz lead II inherits the forward-only filter: T and ST distorted, QRS about 10 ms late. The raw counts are there for anything finer.
+- **Your ears:** step 6c, the headphone check, is still not done, and it now runs on audio upsampled from 1000 Hz. Say if it sounds worse than expected.
+- **Answered 2026-11-04:** the 3 V limit on the PCG PCB's output: a voltage divider on the PCB limits it to 3 V by design (Decisions, "PCG front end"). This does not change S11 item 1: the PCB stays live when the board has no power, so do not unplug the board's USB-C with the PCB connected to PA6.
+- **Answered 2026-11-04:** the `index.html` Connect fix: yes. It went in with S3, and S9 item 4 checks it.
