@@ -1044,6 +1044,7 @@ Commands run from `P` unless they say "repo root". `$S` is a scratch folder outs
 | S2–S7 | Executioner, then tester | None |
 | S8 | Tester, with a stop-and-ask | Flash |
 | S9–S12 | User and tester | Both devices, sensors connected |
+| S13 | Executioner, then tester | None. Reads one kept recording and writes beside it |
 
 S2–S7 all come before the flash so that the viewers work the moment the board changes, and the user disconnects once.
 
@@ -1345,6 +1346,49 @@ S2–S7 all come before the flash so that the viewers work the moment the board 
 - [ ] S12. **A long recording (user).** Record at least 10 minutes, past nine keep-alives, doing what the real use will be, with the tab in view.
 
   **Acceptance:** as S10, scaled to the length. `relative_ppm_halves` differ by under 5 ppm, so a straight line per recording is enough. If not, tell the user that a piecewise fit is needed. S10's recording differed by 16.7 ppm, so this may fail: the limit stays. The user tries the offline correction with the loader's arrays and says whether the file has what they need. This recording is the user's to keep or delete.
+
+- [x] S13. **Four-file export, offline (executioner, then tester, no device).** User decision, 2026-11-05, "Option A": the recording path stays untouched, and the small files stay the master copy. Files: `Tools/load_recording.py`, `Tests/recorder_test.mjs`, `P/README.md`.
+  **Result (2026-11-05):** Code done, and the tester's run on the user's first recording (item 6) passed. On that recording: 275 source files with sha256 unchanged, `ecg_resync` 0 rows, and `pcg.npy` 246210, `ecg_raw.npy` 122806, `ecg_filtered.npy` 245611, `pcg_frame_t` 24621, `pcg_frame_index` 24621, `ecg_frame_t` 122806. The independent script, which does not use the loader, found every sample and timestamp identical, with zero bytes after the last sample in all seven arrays. The export is 3.836 MB, which is 55.7 MB/hour, 18.8× smaller than the small files' 1046 MB/hour. The ECG stream also ended with a 4-byte remainder with no frame marker, unexplained, and left out of the export. **Ruling on the tester's deviation:** a remainder under 40 bytes at the end of a stream cannot hold a whole frame, so it is not a "later break in the 40-byte step", and no sample was omitted. `node Tests/recorder_test.mjs` pass 15, fail 0, and the other four suites still pass 10, 11, 5 and 11. All 14 corruption cases in the test exit 1, name the place, and leave no `-export`, and the same wrapper with no damage exits 0. Scratch proof on synthetic data only: all 22 080 single-bit flips inside the samples of the four files were caught, the 2152 flips that passed sit outside the samples and change none, all 109 structured corruptions were caught with the right message, and all 51 injected breaks in the export code failed a test, while an unbroken copy passed. Known limit: bytes appended after the last sample of a `.npy` pass, because no reader sees them and every sample is still identical. One addition to the plan: `--json` with `--export` is refused with the usage text, because the mixed output would parse as neither. **Added after the tester's run, by the coordinator:** the export folder is created 0o700 and its files 0o600, as private as the recording, which the round-trip test asserts, and the docstring and README say that when the summary shows `ecg_1k_ok` False, `ecg_filtered[2m]` no longer equals frame `m` past the hole. The export the tester made predates this, so it keeps the default modes.
+  1. **Command:** `python3 -I -B Tools/load_recording.py <folder> --export`, added to the usage text. It prints the usual summary first, so `note` (`ALIGN_NOTE`), `errors`, `missing_segments` and `clean_stop` stay in view. A damaged recording still exports as `load()` gives it. With no segments, it exits non-zero and makes no folder.
+     - **Where:** `src = Path(folder).resolve()`, then `src.with_name(src.name + '-export')`. A plain `folder + '-export'` lands inside the recording when the path ends in `/`.
+     - **Order:** if `<name>-export` or `<name>-export.partial` exists, exit non-zero and touch nothing. Otherwise `load()`, `write_export(rec, partial)`, `verify_export(rec, partial)`, then rename `.partial` to `-export`, so that name always means verified. Both names match `ecgpcg-*/`. Only `load()` opens the recording folder.
+  2. **The four files,** described in the loader's docstring and in one README line under the loader's command:
+
+     | File | Type | Holds |
+     |---|---|---|
+     | `pcg.npy` | float32[N] | `pcg`: filtered ADC counts, ×3300/65536 gives mV at PA6. Nominal 1000 Hz, STM32 clock |
+     | `ecg_raw.npy` | float32[M] | `ecg_ii`: unfiltered counts, µV per count unknown. Nominal 500 Hz, module clock |
+     | `ecg_filtered.npy` | float32[2M − 1] | `ecg_1k` as stored, in counts. Nominal 1000 Hz. T and ST distorted, QRS about 10 ms late (forward-only filters) |
+     | `timestamps.npz` | Four named arrays | `pcg_frame_t`, `ecg_frame_t`: float64, host ms (`performance.now()`, one clock), when the chunk with the frame's last byte arrived. `pcg_frame_index`: int64. `ecg_resync`: int64[R, 2] of `(frame, bytes)`, shape (0, 2) when empty |
+
+     `.npz` fits the last file: one `np.savez` file, uncompressed, named arrays of different lengths, no pickle. Every int16 fits float32 exactly.
+     - **PCG sample index:** position `p` in `pcg.npy` is sample `pcg_frame_index[p // 10] + p % 10`, in the frame stamped `pcg_frame_t[p // 10]`. After a dropped frame, `p` alone is wrong.
+     - **ECG sample index:** frame `m` is `ecg_raw[m]`, `ecg_filtered[2m]` and `ecg_frame_t[m]`, and an odd `ecg_filtered` index is halfway between two frames. ECG has no counter, so `m` counts time only between resyncs. A row `(m, bytes)` means `bytes` were skipped just before frame `m` (`m == M`: the stream ended still hunting), and the stamps give the size of the loss.
+  3. **`verify_export`, sample by sample:** it reopens each file and checks for exactly four files, then each array's name, dtype and shape. It then compares raw bytes against the `rec` arrays, with `pcg` and `ecg_ii` widened to float32. Bytes, because a cast down to int16 hides a 3.5, and `==` passes −0.0 and fails NaN. A mismatch exits non-zero, naming the file (and the array in `timestamps.npz`) and the first mismatching index, and says the export is invalid, stays as `.partial`, and the recording is untouched. On success it prints the samples verified per file and per `timestamps.npz` array, never a sample. Code comment: `shortcut: the read-back may come from the OS cache, add fsync and a cache drop if a disk fault ever matters`.
+  4. **What the four files omit:** lead I and the rest of each ECG frame, electrode flags, per-chunk stamps and events stay only in the small files. The docstring, the README line and the command's last output line all say so, and say to keep the recording folder.
+  5. **Self-check, synthetic only: two new tests on `recording()`.** Its folder is `dir/recording`, so the export stays inside the temp `dir`.
+     - **Round trip:** export with a path ending in `/`. Dump the four files with numpy, as `DUMP` does, and compare them byte for byte with `r.expected`, `pcg` and `ecg_ii` as float32. The PCG formula above gives `r.expected.pcg_index` across the 2 dropped frames, and `ecg_resync` holds its one row. Stdout has `ALIGN_NOTE`, the omission line and the counts, in under 5000 characters. The recording's names and bytes are unchanged. A second export exits non-zero and changes nothing.
+     - **Corruption:** a `-c` snippet wraps `write_export` to damage its output, then runs `export()`, once each for a flipped low bit in each `.npy` and in one `timestamps.npz` array, +0.5 on one `pcg.npy` value, a file one sample short, and a float64 `pcg.npy`. Each exits non-zero, names the file and the index or length, and leaves no `-export` folder.
+  6. **Tester, once, on the user's first recording.** Write `$S/check_export.py` first, then run this in one shell, so the hashes stay in memory:
+     ```
+     R=<the first real recording>
+     before=$(cd "$R" && sha256sum *); echo "$before" | wc -l
+     python3 -I -B Tools/load_recording.py "$R" --export; echo "exit $?"
+     [ "$before" = "$(cd "$R" && sha256sum *)" ] && echo 'source unchanged'
+     python3 -I -B "$S/check_export.py" "$R"
+     du -cb "$R-export"/* | tail -1
+     git status --porcelain | grep -c ecgpcg
+     ```
+     `check_export.py` is the tester's own, written from the format tables in Decisions and protocol §8, with no import of `load_recording` and no line copied from it. It walks the raw records, rebuilds every frame, and compares all four files, every array, with exact equality. It applies the stale first frame, unconfirmed last frame and last-byte `t` rules, hunts only for the first frame, and fails on any later break in the 24- or 40-byte step. It writes nothing and prints only counts and the first mismatching index.
+
+  **Acceptance:**
+  - `node Tests/recorder_test.mjs` ends with `fail 0` and at least `pass 15`.
+  - The export prints `exit 0`, then `source unchanged`, and the first line matches the folder's segment count.
+  - The command and `check_export.py` both report, with no mismatch: `pcg.npy` 246210, `ecg_raw.npy` 122806, `ecg_filtered.npy` 245611, `pcg_frame_t` and `pcg_frame_index` 24621, `ecg_frame_t` 122806, `ecg_resync` 0 rows. These follow from S10's 24621 PCG frames, 122806 ECG frames and 245611 kind 4 values.
+  - The tester reports the export's size in MB and the MB/hour it implies. Expected from the array sizes: about 3.84 MB and about 56 MB/hour for 247.78 s, against about 1 GB/hour for the small files.
+  - The last command prints `0`. The export stays beside the recording, the user's to keep. The tester reports counts and size only: no sample or hash is printed, and no real data goes into the repo, a fixture or `$S`.
+
+  **Not in this step:** a drift-corrected or resampled export, other file formats, compression, an overwrite option.
 
 ## Not doing
 

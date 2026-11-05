@@ -2,7 +2,8 @@
 // From the project folder: node Tests/recorder_test.mjs
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -694,4 +695,201 @@ test('damage: a missing file, a truncated file and bad records are reported, and
   assert.deepEqual([s.ecg_frames, s.ecg_resyncs, s.ecg_skipped_after_lock], [6, 2, parser.stats.skipped]);
   assert.equal(s.ecg_skipped_after_lock, chain.stats.skippedAfterLock);
   assert.equal(s.ecg_1k_ok, true);
+});
+
+// The export: Tools/load_recording.py <folder> --export
+
+const OMITTED = 'Lead I and the rest of each ECG frame, electrode flags, per-chunk stamps and events stay only in the small files: keep the recording folder.';
+const exportOf = (dir, ...flags) => spawnSync('python3', ['-I', '-B', LOADER, dir, '--export', ...flags], { encoding: 'utf8' });
+const exists = (p) => fs.stat(p).then(() => true, () => false);
+const contents = async (dir) => Promise.all((await fs.readdir(dir)).sort().map(async (name) => `${name} ${createHash('sha256').update(await fs.readFile(path.join(dir, name))).digest('hex')}`));
+const dumpExport = (dir, out) => JSON.parse(execFileSync('python3', ['-I', '-B', '-c', EXPORT_DUMP, dir, out], { encoding: 'utf8' }));
+
+const EXPORT_DUMP = `
+import json, sys
+from pathlib import Path
+import numpy as np
+folder, out = map(Path, sys.argv[1:])
+arrays = {p.stem: np.load(p, allow_pickle=False) for p in folder.glob('*.npy')}
+with np.load(folder / 'timestamps.npz', allow_pickle=False) as npz:
+    arrays.update({key: npz[key] for key in npz.files})
+for key, value in arrays.items():
+    value.tofile(out / f'{key}.bin')
+print(json.dumps({key: [value.dtype.name, value.shape] for key, value in arrays.items()}))
+`;
+
+// Runs the real export() with write_export wrapped: argv[3] is one Python line that damages what was written
+const CORRUPT = `
+import os, sys
+import numpy as np
+sys.path.insert(0, sys.argv[1])
+import load_recording
+
+write_export = load_recording.write_export
+
+def damage(rec, partial):
+    write_export(rec, partial)
+    pcg, raw, filtered, stamps = (partial / name for name in ('pcg.npy', 'ecg_raw.npy', 'ecg_filtered.npy', 'timestamps.npz'))
+    exec(sys.argv[3])
+
+load_recording.write_export = damage
+load_recording.export(sys.argv[2])
+`;
+
+test('export: the four files match the recording byte for byte, beside it, and the recording stays as it was', async () => {
+  const r = await recording();
+  const source = await contents(r.folder);
+  const exported = `${r.folder}-export`, partial = `${exported}.partial`;
+
+  const first = exportOf(`${r.folder}/`);
+  assert.equal(first.status, 0, first.stderr);
+  assert.deepEqual(await contents(r.folder), source, 'the recording changed');
+  assert.equal(await exists(partial), false);
+  assert.equal((await fs.stat(exported)).mode & 0o777, 0o700, 'the folder is private');
+  for (const name of await fs.readdir(exported)) assert.equal((await fs.stat(path.join(exported, name))).mode & 0o777, 0o600, name);
+
+  const out = path.join(r.dir, 'export-dump');
+  await fs.mkdir(out);
+  const shapes = dumpExport(exported, out);
+  assert.deepEqual((await fs.readdir(exported)).sort(), ['ecg_filtered.npy', 'ecg_raw.npy', 'pcg.npy', 'timestamps.npz']);
+  assert.equal((await fs.readFile(path.join(exported, 'timestamps.npz'))).readUInt16LE(8), 0, 'timestamps.npz is stored, not compressed');
+  const M = r.frames, N = r.expected.pcg.length, F = r.liveFrames;
+  assert.equal(N, 10 * F);
+  const wanted = {
+    pcg: [Float32Array.from(r.expected.pcg), 'float32', [N]],
+    ecg_raw: [Float32Array.from(r.expected.ecg_ii), 'float32', [M]],
+    ecg_filtered: [r.expected.ecg_1k, 'float32', [2 * M - 1]],
+    pcg_frame_t: [r.expected.pcg_frame_t, 'float64', [F]],
+    ecg_frame_t: [r.expected.ecg_frame_t, 'float64', [M]],
+    pcg_frame_index: [r.expected.pcg_frame_index, 'int64', [F]],
+    ecg_resync: [BigInt64Array.of(BigInt(r.resyncFrame), 23n), 'int64', [1, 2]],
+  };
+  assert.deepEqual(Object.keys(shapes).sort(), Object.keys(wanted).sort());
+  for (const [key, [want, dtype, shape]] of Object.entries(wanted)) {
+    assert.deepEqual(shapes[key], [dtype, shape], key);
+    assert.equal(Buffer.compare(await fs.readFile(path.join(out, `${key}.bin`)), bytesOf(want)), 0, `${key} differs`);
+  }
+
+  // Position p alone is wrong after the 2 dropped frames, and the documented formula is right
+  const index = new BigInt64Array(new Uint8Array(await fs.readFile(path.join(out, 'pcg_frame_index.bin'))).buffer);
+  const formula = BigInt64Array.from({ length: N }, (_, p) => index[Math.floor(p / 10)] + BigInt(p % 10));
+  assert.equal(Buffer.compare(bytesOf(formula), bytesOf(r.expected.pcg_index)), 0);
+  assert.notEqual(r.expected.pcg_index.at(-1), BigInt(N - 1));
+
+  const { stdout } = first;
+  assert.ok(stdout.includes(ALIGN_NOTE));
+  for (const line of ['errors: []', 'missing_segments: []', 'clean_stop: True']) assert.ok(stdout.includes(line), line);
+  assert.ok(stdout.indexOf('clean_stop') < stdout.indexOf('pcg.npy: '), 'the summary comes first');
+  const counts = [
+    `pcg.npy: ${N} samples`, `ecg_raw.npy: ${M} samples`, `ecg_filtered.npy: ${2 * M - 1} samples`, `timestamps.npz pcg_frame_t: ${F} samples`,
+    `timestamps.npz ecg_frame_t: ${M} samples`, `timestamps.npz pcg_frame_index: ${F} samples`, 'timestamps.npz ecg_resync: 1 rows',
+  ];
+  for (const line of counts) assert.ok(stdout.includes(`${line} verified`), line);
+  assert.equal(stdout.trimEnd().split('\n').at(-1), OMITTED);
+  assert.ok(stdout.length < 5000, `${stdout.length} characters`);
+
+  const done = await contents(exported);
+  const second = exportOf(r.folder);
+  assert.equal(second.status, 1);
+  assert.match(second.stderr, /already exists/);
+  assert.deepEqual(await contents(exported), done);
+  assert.deepEqual(await contents(r.folder), source);
+  assert.equal(await exists(partial), false);
+
+  // A damaged recording still exports, with its problems in the summary
+  const damaged = path.join(r.dir, 'damaged');
+  await fs.cp(r.folder, damaged, { recursive: true });
+  const files = (await fs.readdir(damaged)).sort();
+  const hole = Math.floor(files.length / 2);
+  await fs.rm(path.join(damaged, files[hole]));
+  const last = path.join(damaged, files.at(-1));
+  await fs.truncate(last, (await fs.stat(last)).size - 5);
+  const holed = exportOf(damaged);
+  assert.equal(holed.status, 0, holed.stderr);
+  for (const line of [`missing_segments: [${hole + 1}]`, 'overruns the file', 'ecg_1k_ok: False', 'clean_stop: False']) assert.ok(holed.stdout.includes(line), line);
+  assert.ok(await exists(`${damaged}-export`));
+
+  // Only a folder with no segments is refused, and it makes nothing
+  const stray = path.join(r.dir, 'stray-only');
+  await fs.mkdir(stray);
+  await fs.writeFile(path.join(stray, 'stray.ecgpcg'), Uint8Array.of(1));
+  for (const nothing of [stray, path.join(r.dir, 'never made')]) {
+    const refused = exportOf(nothing);
+    assert.equal(refused.status, 1);
+    assert.match(refused.stderr, /No segment files/);
+    assert.ok(refused.stdout.includes('no segment files'), 'the summary still shows why');
+    for (const made of ['-export', '-export.partial']) assert.equal(await exists(nothing + made), false, nothing + made);
+  }
+
+  assert.equal(exportOf(stray, '--json').status, 1, '--json and --export together are refused');
+  assert.equal(await exists(`${stray}-export.partial`), false);
+
+  // No resync gives shape (0, 2), the bytes compare passes the -0 and NaN that == would fail, and . lands beside the folder too
+  const clean = path.join(r.dir, 'clean'), cleanOut = path.join(r.dir, 'clean-dump');
+  await fs.mkdir(clean);
+  await fs.mkdir(cleanOut);
+  const odd = Float32Array.of(1.5, -0, NaN);
+  const log = createLog(saveTo(clean));
+  log.add(1, [PCG, cat(pcgFrame(1), pcgFrame(2), pcgFrame(3))], [ECG, ecgFrames(0, 2)], [ECG_1K, new Uint8Array(odd.buffer)]);
+  assert.equal(await log.flush(), true);
+  const quiet = spawnSync('python3', ['-I', '-B', LOADER, '.', '--export'], { encoding: 'utf8', cwd: clean });
+  assert.equal(quiet.status, 0, quiet.stderr);
+  assert.ok(quiet.stdout.includes('timestamps.npz ecg_resync: 0 rows verified'));
+  const small = dumpExport(`${clean}-export`, cleanOut);
+  assert.deepEqual(small.ecg_resync, ['int64', [0, 2]]);
+  assert.equal(Buffer.compare(await fs.readFile(path.join(cleanOut, 'ecg_filtered.bin')), bytesOf(odd)), 0);
+});
+
+test('export: damage to any file exits non-zero, names the place, and never reaches the -export name', async () => {
+  const r = await recording();
+  const exported = `${r.folder}-export`, partial = `${exported}.partial`;
+  await fs.rm(exported, { recursive: true, force: true });
+  const source = await contents(r.folder);
+  const run = (code) => spawnSync('python3', ['-I', '-B', '-c', CORRUPT, TOOLS, r.folder, code], { encoding: 'utf8' });
+
+  const N = r.expected.pcg.length;
+  const flip = (file) => `a = np.load(${file}); a.view(np.uint32)[1234] ^= 1; np.save(${file}, a)`;
+  const cases = [
+    [flip('pcg'), /^pcg\.npy: first mismatch at index 1234\./],
+    [flip('raw'), /^ecg_raw\.npy: first mismatch at index 1234\./],
+    [flip('filtered'), /^ecg_filtered\.npy: first mismatch at index 1234\./],
+    ["s = dict(np.load(stamps)); s['ecg_frame_t'].view(np.uint64)[1234] ^= np.uint64(1); np.savez(stamps, **s)", /^timestamps\.npz ecg_frame_t: first mismatch at index 1234\./],
+    ["s = dict(np.load(stamps)); s['ecg_resync'][0, 1] ^= 1; np.savez(stamps, **s)", /^timestamps\.npz ecg_resync: first mismatch at index 0\./],
+    ['a = np.load(pcg); a[77] += 0.5; np.save(pcg, a)', /^pcg\.npy: first mismatch at index 77\./],
+    ['a = np.load(pcg); a[0] = -0.0; np.save(pcg, a)', /^pcg\.npy: first mismatch at index 0\./],
+    ['np.save(pcg, np.load(pcg)[:-1])', new RegExp(`^pcg\\.npy: float32 \\(${N - 1},\\), expected float32 \\(${N},\\)`)],
+    ['os.truncate(pcg, pcg.stat().st_size - 4)', new RegExp(`^pcg\\.npy: .*${N}`)],
+    ['np.save(pcg, np.load(pcg).astype(np.float64))', new RegExp(`^pcg\\.npy: float64 \\(${N},\\), expected float32 \\(${N},\\)`)],
+    ['b = bytearray(stamps.read_bytes()); b[2000] ^= 1; stamps.write_bytes(b)', /^timestamps\.npz pcg_frame_t: .*CRC/],
+    ["s = dict(np.load(stamps)); del s['ecg_resync']; np.savez(stamps, **s)", /^timestamps\.npz: holds .*expected/],
+    ["(partial / 'extra.npy').touch()", /^recording-export\.partial: holds .*extra\.npy/],
+    ['raw.unlink()', /^recording-export\.partial: holds .*expected/],
+  ];
+  for (const [code, place] of cases) {
+    const { status, stderr } = run(code);
+    assert.equal(status, 1, `${code}: ${stderr}`);
+    assert.match(stderr, place, code);
+    assert.match(stderr, /The export is invalid: it stays as recording-export\.partial, and the recording is untouched\./, code);
+    assert.equal(await exists(exported), false, code);
+    assert.equal(await exists(partial), true, code);
+    await fs.rm(partial, { recursive: true });
+  }
+
+  // A .partial left behind blocks the next export, which touches nothing
+  await fs.mkdir(partial);
+  await fs.writeFile(path.join(partial, 'pcg.npy'), 'left over');
+  const leftOver = await contents(partial);
+  const refused = exportOf(r.folder);
+  assert.equal(refused.status, 1);
+  assert.match(refused.stderr, /already exists/);
+  assert.deepEqual(await contents(partial), leftOver);
+  assert.equal(await exists(exported), false);
+  await fs.rm(partial, { recursive: true });
+
+  // The same wrapper with no damage passes, so the failures above came from the damage
+  const control = run('pass');
+  assert.equal(control.status, 0, control.stderr);
+  assert.ok(await exists(exported));
+  assert.equal(await exists(partial), false);
+  assert.deepEqual(await contents(r.folder), source);
 });

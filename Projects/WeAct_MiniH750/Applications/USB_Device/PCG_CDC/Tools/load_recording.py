@@ -1,4 +1,4 @@
-"""Load an ECG + PCG recording made by Web/recorder.html: python3 -I Tools/load_recording.py <folder> [--json]
+"""Load an ECG + PCG recording made by Web/recorder.html: python3 -I -B Tools/load_recording.py <folder> [--json | --export]
 
 A recording is a folder of 00001.ecgpcg, 00002.ecgpcg, ... Concatenated in name order they form one log of
 little-endian records, and a file only ever ends on a record boundary:
@@ -33,6 +33,28 @@ summary(rec) holds counts and rates, no samples, and clean_stop is false when th
 sign of a lost last file. Its straight line through t and the sample index is a report, not a
 correction: the ECG and PCG clocks drift apart and this file corrects nothing. The fixed offset between the ECG and PCG
 paths is an unmeasured estimate of about +-3 ms, and no fit here can show it.
+
+--export prints the summary, then writes four files to <folder>-export, beside the recording and never in it. A damaged
+recording exports as load() gives it, and a folder with no segments is refused. If <folder>-export or <folder>-export.partial
+exists, nothing happens. The files are read back sample by sample in .partial, and only then renamed, so -export means verified.
+
+    pcg.npy           float32[N]       pcg: filtered ADC counts, x 3300/65536 gives mV at PA6. Nominal 1000 Hz, STM32 clock
+    ecg_raw.npy       float32[M]       ecg_ii: unfiltered counts, uV per count unknown. Nominal 500 Hz, module clock
+    ecg_filtered.npy  float32[2M - 1]  ecg_1k as stored, in counts. Nominal 1000 Hz. T and ST distorted, QRS about 10 ms late
+                                       (forward-only filters)
+    timestamps.npz    four arrays      pcg_frame_t, ecg_frame_t: float64, host ms (performance.now(), one clock), when the
+                                       chunk with the frame's last byte arrived
+                                       pcg_frame_index: int64
+                                       ecg_resync: int64[R, 2] of (frame, bytes), shape (0, 2) when empty
+
+Position p in pcg.npy is sample pcg_frame_index[p // 10] + p % 10, in the frame stamped pcg_frame_t[p // 10]. After a dropped
+frame, p alone is wrong. ECG frame m is ecg_raw[m], ecg_filtered[2m] and ecg_frame_t[m], and an odd ecg_filtered index is
+halfway between two frames. ECG has no counter, so m counts time only between resyncs. A row (m, bytes) means bytes were
+skipped just before frame m (m == M: the stream ended still hunting), and the stamps give the size of the loss. When the
+summary shows ecg_1k_ok False (a recording with a hole), ecg_filtered[2m] no longer equals frame m past the hole, so use
+ecg_raw and ecg_frame_t there.
+
+Lead I and the rest of each ECG frame, electrode flags, per-chunk stamps and events stay only in the small files: keep the recording folder.
 """
 import json
 import math
@@ -45,6 +67,7 @@ import numpy as np
 PCG, ECG, EVENT, ECG_1K = 1, 2, 3, 4
 HEADER = struct.Struct('<dIB')
 PCG_FRAME, ECG_FRAME = 24, 40
+OMITTED = 'Lead I and the rest of each ECG frame, electrode flags, per-chunk stamps and events stay only in the small files: keep the recording folder.'
 
 
 def read_records(folder, errors):
@@ -239,13 +262,95 @@ def summary(rec):
     }
 
 
+def show(report):
+    for key, value in report.items():
+        print(f'{key}: {value}')
+
+
+def export_arrays(rec):
+    """The arrays as the four files must hold them: the .npy files by name, and the arrays of timestamps.npz by key."""
+    files = {
+        'pcg.npy': rec['pcg'].astype(np.float32),
+        'ecg_raw.npy': rec['ecg_ii'].astype(np.float32),
+        'ecg_filtered.npy': rec['ecg_1k'],
+    }
+    stamps = {
+        'pcg_frame_t': rec['pcg_frame_t'],
+        'ecg_frame_t': rec['ecg_frame_t'],
+        'pcg_frame_index': rec['pcg_frame_index'],
+        'ecg_resync': np.array(rec['ecg_resync'], dtype=np.int64).reshape(-1, 2),
+    }
+    return files, stamps
+
+
+def write_export(rec, partial):
+    files, stamps = export_arrays(rec)
+    partial.mkdir(mode=0o700)  # health data, as private as the recording, and nobody else can reach the files before the chmod
+    for name, array in files.items():
+        np.save(partial / name, array, allow_pickle=False)
+    np.savez(partial / 'timestamps.npz', **stamps)
+    for path in partial.iterdir():
+        path.chmod(0o600)
+
+
+def same_bytes(got, want):
+    """Bytes, because a cast down to int16 hides a 3.5, and == passes -0.0 and fails NaN. Returns the length."""
+    if got.dtype != want.dtype or got.shape != want.shape:
+        raise ValueError(f'{got.dtype} {got.shape}, expected {want.dtype} {want.shape}')
+    differ = np.flatnonzero(np.frombuffer(got.tobytes(), np.uint8) != np.frombuffer(want.tobytes(), np.uint8))
+    if len(differ):
+        raise ValueError(f'first mismatch at index {differ[0] // (got.nbytes // len(got))}')
+    return len(got)
+
+
+def verify_export(rec, partial):
+    # shortcut: the read-back may come from the OS cache, add fsync and a cache drop if a disk fault ever matters
+    files, stamps = export_arrays(rec)
+    expected = sorted([*files, 'timestamps.npz'])
+    where, verified = partial.name, []
+    try:
+        found = sorted(p.name for p in partial.iterdir())
+        if found != expected:
+            raise ValueError(f'holds {found}, expected {expected}')
+        for name, want in files.items():
+            where = name
+            verified.append(f'{name}: {same_bytes(np.load(partial / name, allow_pickle=False), want)} samples verified')
+        where = 'timestamps.npz'
+        with np.load(partial / where, allow_pickle=False) as npz:
+            if sorted(npz.files) != sorted(stamps):
+                raise ValueError(f'holds {sorted(npz.files)}, expected {sorted(stamps)}')
+            for key, want in stamps.items():
+                where = f'timestamps.npz {key}'
+                verified.append(f'{where}: {same_bytes(npz[key], want)} {"rows" if want.ndim == 2 else "samples"} verified')
+    except Exception as e:  # a damaged file raises whatever numpy or zipfile meets first, and all of it means invalid
+        sys.exit(f'{where}: {e}. The export is invalid: it stays as {partial.name}, and the recording is untouched.')
+    print('\n'.join(verified))
+
+
+def export(folder):
+    src = Path(folder).resolve()  # a plain folder + '-export' lands inside the recording when the path ends in /
+    done, partial = src.with_name(src.name + '-export'), src.with_name(src.name + '-export.partial')
+    if done.exists() or partial.exists():
+        sys.exit(f'{done.name} or {partial.name} already exists: nothing done.')
+    rec = load(src)
+    show(summary(rec))
+    if not rec['segments']:
+        sys.exit('No segment files: nothing exported.')
+    write_export(rec, partial)
+    verify_export(rec, partial)
+    partial.rename(done)
+    print(f'Exported to {done}')
+    print(OMITTED)
+
+
 if __name__ == '__main__':
-    folders = [a for a in sys.argv[1:] if a != '--json']
-    if len(folders) != 1:
-        sys.exit('usage: python3 -I Tools/load_recording.py <folder> [--json]')
-    report = summary(load(folders[0]))
-    if '--json' in sys.argv:
-        print(json.dumps(report))
+    flags = {'--json', '--export'}
+    folders = [a for a in sys.argv[1:] if a not in flags]
+    if len(folders) != 1 or flags <= set(sys.argv):
+        sys.exit('usage: python3 -I -B Tools/load_recording.py <folder> [--json | --export]')
+    if '--export' in sys.argv:
+        export(folders[0])
+    elif '--json' in sys.argv:
+        print(json.dumps(summary(load(folders[0]))))
     else:
-        for key, value in report.items():
-            print(f'{key}: {value}')
+        show(summary(load(folders[0])))

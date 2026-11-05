@@ -146,10 +146,12 @@ frames, by linear interpolation.
 `Tools/load_recording.py` needs numpy, and it reads a damaged recording without raising:
 
 ```
-python3 -I Tools/load_recording.py <folder> [--json]
+python3 -I -B Tools/load_recording.py <folder> [--json | --export]
 ```
 
-That prints a summary with no samples: counts, gaps, rates and residuals. `load(folder)` in the same file returns the
+`--export` prints the summary, then writes `<folder>-export/` beside the recording, never in it: `pcg.npy` (float32, `pcg`, filtered ADC counts, × 3300/65536 gives mV at PA6, nominal 1000 Hz, STM32 clock), `ecg_raw.npy` (float32, `ecg_ii`, unfiltered counts, µV per count unknown, nominal 500 Hz, module clock), `ecg_filtered.npy` (float32, `ecg_1k` as stored, in counts, nominal 1000 Hz, T and ST distorted, QRS about 10 ms late) and `timestamps.npz` (`pcg_frame_t` and `ecg_frame_t`, float64 host ms when the chunk with the frame's last byte arrived, `pcg_frame_index`, int64, and `ecg_resync`, int64 rows of `(frame, bytes)`, shape (0, 2) when empty). PCG position `p` is sample `pcg_frame_index[p // 10] + p % 10`, stamped `pcg_frame_t[p // 10]`, so after a dropped frame `p` alone is wrong. ECG frame `m` is `ecg_raw[m]`, `ecg_filtered[2m]` and `ecg_frame_t[m]`, an odd `ecg_filtered` index is halfway between two frames, and `m` counts time only between resyncs: a row `(m, bytes)` means `bytes` were skipped just before frame `m` (`m` equal to the frame count: the stream ended still hunting). When the summary shows `ecg_1k_ok` False (a recording with a hole), `ecg_filtered[2m]` no longer equals frame `m` past the hole, so use `ecg_raw` and `ecg_frame_t` there. Every sample is read back before the folder gets the `-export` name, and a mismatch exits non-zero and leaves it as `<folder>-export.partial`. A damaged recording exports as `load()` gives it, with its problems in the summary, a folder with no segments is refused, and if either name already exists nothing happens. Lead I and the rest of each ECG frame, electrode flags, per-chunk stamps and events stay only in the small files: keep the recording folder.
+
+The summary holds no samples: counts, gaps, rates and residuals. `load(folder)` in the same file returns the
 arrays (`pcg`, `pcg_index`, `pcg_frame_t`, `ecg_i`, `ecg_ii`, `ecg_frame_t`, `ecg_1k`, `ecg_resync`, `events`, …). Gaps stay
 visible: `pcg_drops` counts frames missing by `seq`, `ecg_resync` lists each marker hunt, `missing_segments` lists holes
 in the file numbering, and `clean_stop` is false when the `stop` event is missing, the only sign of a lost last file.
