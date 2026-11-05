@@ -68,3 +68,7 @@ _deps
 /***** Folders Bardo *****/
 build
 Drivers/FreeRTOS
+
+# Recordings are health data
+ecgpcg-*/
+__pycache__/

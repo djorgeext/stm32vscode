@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ECG and PCG recorder</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; margin: 1rem; color: #111; background: #fff; }
+  button { font: inherit; padding: 0.4rem 1.2rem; }
+  button:focus-visible { outline: 3px solid #0b57d0; outline-offset: 2px; }
+  #status { font-size: 1.1rem; }
+  #warn { color: #b00020; font-weight: 600; }
+  figure { margin: 0; }
+  canvas { display: block; width: 100%; height: 34vh; border: 1px solid #767676; }
+  h2 { font-size: 1.1rem; margin: 0.5rem 0 0.25rem; }
+</style>
+</head>
+<body>
+<h1>ECG and PCG recorder</h1>
+<p><button id="allow" type="button">Allow device</button> <button id="start" type="button" disabled>Start</button></p>
+<p id="devices" role="status"></p>
+<p id="status"><span id="msg" role="status">Starting. If this stays, serve the page from the repo root with
+  <code>python3 -m http.server -b 127.0.0.1 -d Projects/WeAct_MiniH750/Applications/USB_Device/PCG_CDC/Web 8001</code>
+  and open http://localhost:8001/recorder.html.</span> <span id="stats"></span></p>
+<p id="leads" role="status"></p>
+<p id="warn" role="status"></p>
+<figure>
+  <h2>ECG lead II (LL − RA)</h2>
+  <canvas id="traceEcg" role="img" aria-label="Live ECG, lead II, last 5 seconds, newest on the right"></canvas>
+  <h2>PCG</h2>
+  <canvas id="tracePcg" role="img" aria-label="Live PCG, last 5 seconds, newest on the right"></canvas>
+  <figcaption>ECG lead II with the forward-only filters, upsampled to 1000 Hz by linear interpolation. PCG band-passed
+    20–200 Hz and reduced to 1000 Hz on the board. Last 5 s, newest on the right. <span id="note"></span></figcaption>
+</figure>
+<script type="module">
+import { createLog, startSession, findPorts, leadIILine, ECG_PORT, PCG_PORT, ALIGN_NOTE } from './recorder.js';
+
+const RING = 5000; // 5 s at 1000 Hz
+const MIN_FULL = 50; // counts for ECG, mV for PCG: a quiet trace stays flat instead of filling the height
+const MV_PER_COUNT = 3300 / 65536;
+const NAMES = { ecg: 'ECG module', pcg: 'PCG board' };
+const LABELS = { idle: 'Start', starting: 'Start', recording: 'Stop', stopping: 'Stop', retry: 'Retry save', saving: 'Retry save' };
+
+let state = 'idle', allowing = false, found = { ecg: null, pcg: null };
+let dir = null, folderName = '', log = null, session = null;
+let lost = [], last = { ecg: 0, pcg: 0 }, started = 0, length = '';
+let dirty = true, t0 = 0, f0 = 0, w0 = 0;
+
+const allowBtn = document.getElementById('allow');
+const startBtn = document.getElementById('start');
+const devices = document.getElementById('devices');
+const msg = document.getElementById('msg');
+const stats = document.getElementById('stats');
+const leads = document.getElementById('leads');
+const warn = document.getElementById('warn');
+const trace = (id, unit) => {
+  const canvas = document.getElementById(id);
+  return { canvas, ctx: canvas.getContext('2d'), ring: new Float32Array(RING), written: 0, full: MIN_FULL, unit };
+};
+const ecgTrace = trace('traceEcg', 'counts');
+const pcgTrace = trace('tracePcg', 'mV');
+const traces = [ecgTrace, pcgTrace];
+
+document.getElementById('note').textContent = ALIGN_NOTE;
+msg.textContent = 'Not recording.';
+if (!('serial' in navigator) || !('showDirectoryPicker' in window)) {
+  allowBtn.disabled = true;
+  msg.textContent = isSecureContext
+    ? 'This browser has no Web Serial or no folder access: open the page in Chrome or Edge.'
+    : `Web Serial needs a secure page and ${location.origin} is not one: open http://localhost:8001/recorder.html instead.`;
+} else {
+  navigator.serial.addEventListener('connect', refresh);
+  navigator.serial.addEventListener('disconnect', refresh);
+  refresh();
+}
+
+allowBtn.addEventListener('click', allow);
+startBtn.addEventListener('click', () => (state === 'recording' ? stop() : state === 'retry' ? retry() : start()));
+addEventListener('resize', () => (dirty = true));
+addEventListener('beforeunload', (e) => {
+  if (session || state === 'retry' || state === 'saving') e.preventDefault();
+});
+
+const setText = (el, text) => {
+  if (el.textContent !== text) el.textContent = text; // a live region announces every write
+};
+const refocus = (btn) => {
+  if (document.activeElement === document.body) btn.focus(); // disabling dropped focus, which strands a keyboard user
+};
+const two = (n) => String(n).padStart(2, '0');
+const mmss = (ms) => `${Math.floor(ms / 60000)}:${two(Math.floor(ms / 1000) % 60)}`;
+const folderFor = (d) =>
+  `ecgpcg-${d.getFullYear()}${two(d.getMonth() + 1)}${two(d.getDate())}-${two(d.getHours())}${two(d.getMinutes())}${two(d.getSeconds())}`;
+
+// Both buttons are set only here, from the state, so an unplug during a recording cannot disable Stop
+function render() {
+  startBtn.textContent = LABELS[state];
+  startBtn.disabled = state === 'idle' ? !(found.ecg && found.pcg) : state !== 'recording' && state !== 'retry';
+  allowBtn.disabled = allowing || state !== 'idle';
+}
+
+function setState(next) {
+  state = next;
+  render();
+}
+
+async function refresh() {
+  found = findPorts(await navigator.serial.getPorts());
+  const line = (name, port) => `${name}: ${port ? 'found' : 'not found'}.`;
+  const hint = found.ecg && found.pcg ? '' : ' Plug it in, then click Allow device if it stays not found.';
+  setText(devices, `${line(NAMES.ecg, found.ecg)} ${line(NAMES.pcg, found.pcg)}${hint}`);
+  render();
+}
+
+async function allow() {
+  allowing = true; // requestPort takes one device per click, and its dialog stays open until the user answers
+  render();
+  try {
+    await navigator.serial.requestPort({ filters: [ECG_PORT, PCG_PORT] });
+  } catch (e) {
+    msg.textContent = `No device allowed: ${e.message}`;
+  }
+  allowing = false;
+  await refresh();
+  refocus(allowBtn);
+}
+
+async function save(folder, index, blob) {
+  const handle = await folder.getFileHandle(`${String(index).padStart(5, '0')}.ecgpcg`, { create: true });
+  const file = await handle.createWritable();
+  try {
+    await file.write(blob);
+    await file.close(); // only close() puts the data in the named file, which is why each segment is its own file
+  } catch (e) {
+    await file.abort().catch(() => {});
+    throw e;
+  }
+}
+
+function onEcg(y) {
+  if (y.length) last.ecg = performance.now();
+  for (const v of y) ecgTrace.ring[ecgTrace.written++ % RING] = v;
+  dirty = true;
+}
+
+function onPcg(frames) {
+  if (frames.length) last.pcg = performance.now();
+  for (const s of frames) for (const v of s) pcgTrace.ring[pcgTrace.written++ % RING] = v * MV_PER_COUNT;
+  dirty = true;
+}
+
+async function start() {
+  setState('starting'); // disabled for the whole attempt, so a double click cannot start twice or stop
+  msg.textContent = dir ? 'Starting the recording…' : 'Choose a folder for the recordings, outside the repo. Chrome may refuse Documents itself, so make a subfolder.';
+  const opened = [];
+  let step = 'Folder', hint = '';
+  try {
+    dir ??= await showDirectoryPicker({ id: 'ecgpcg', mode: 'readwrite', startIn: 'documents' }); // needs this click, so it comes first
+    found = findPorts(await navigator.serial.getPorts());
+    for (const name of ['ecg', 'pcg']) {
+      if (found[name]) continue;
+      step = NAMES[name];
+      throw new Error('not found, so click Allow device.');
+    }
+    const { ecg, pcg } = found;
+    const recording = folderFor(new Date());
+    const folder = await dir.getDirectoryHandle(recording, { create: true });
+    step = NAMES.pcg;
+    hint = ' Another page may hold the port.';
+    await pcg.open({ baudRate: 115200, bufferSize: 65536 }); // CDC ignores the baud rate
+    opened.push(pcg);
+    step = NAMES.ecg;
+    await ecg.open({ baudRate: 230400, bufferSize: 65536 }); // the MCP2200 is a real UART bridge, so its baud rate matters
+    opened.push(ecg);
+    await ecg.setSignals({ dataTerminalReady: false, requestToSend: false }); // as the vendor program
+
+    folderName = `${dir.name}/${recording}`;
+    log = createLog((index, blob) => save(folder, index, blob));
+    lost = [];
+    for (const t of traces) {
+      t.ring.fill(0);
+      t.written = 0;
+    }
+    started = t0 = last.ecg = last.pcg = performance.now();
+    f0 = w0 = 0;
+    session = startSession({ ecgPort: ecg, pcgPort: pcg, log, now: () => performance.now(), onPcg, onEcg, onLost: (name, message) => lost.push([name, message]) });
+    session.done.catch(() => false).then(ended); // a session that fails still holds its data, so it goes to Retry save
+    setState('recording');
+    msg.textContent = `Recording to ${folderName}. Click Stop to end it.`;
+    stats.textContent = 'Measuring the rates…';
+  } catch (e) {
+    await Promise.all(opened.map((p) => p.close().catch(() => {}))); // only ours: after a failed open, the port may be another page's
+    if (step === 'Folder') dir = null; // a folder deleted since the last Start would otherwise fail every Start
+    msg.textContent = `Not started: ${step}: ${e.message}${hint}`;
+    setState('idle');
+  }
+  refocus(startBtn);
+}
+
+function stop() {
+  setState('stopping');
+  msg.textContent = `Stopping, and saving the last data to ${folderName}…`;
+  session.stop().catch(() => {}); // done reports the outcome
+}
+
+function settle(saved) {
+  if (saved) {
+    msg.textContent = `Saved ${length} in ${folderName} (${log.stats.saved} files). ${ALIGN_NOTE}`;
+    setState('idle');
+  } else {
+    msg.textContent = `Not saved yet: ${log.stats.unsaved} files of this recording to ${folderName} are still only in memory. Keep this tab open and click Retry save.`;
+    setState('retry'); // no new Start until this is saved: a new log would leave these segments behind
+  }
+  refocus(startBtn);
+}
+
+// After Stop, or when both devices were lost and the session ended itself
+function ended(saved) {
+  length = mmss(performance.now() - started);
+  session = null;
+  leads.textContent = '';
+  settle(saved);
+}
+
+async function retry() {
+  setState('saving');
+  msg.textContent = `Saving to ${folderName}…`;
+  settle(await log.flush());
+}
+
+function warnings(now) {
+  const w = lost.map(([name, message]) => `${NAMES[name]} lost: ${message} It stays out of this recording.`);
+  if (state === 'recording') {
+    if (!lost.some(([name]) => name === 'ecg') && now - last.ecg > 3000) w.push('No ECG frames for over 3 s.');
+    if (!lost.some(([name]) => name === 'pcg') && now - last.pcg > 3000) w.push('No PCG samples for over 3 s.');
+  }
+  if (log?.stats.error) w.push(`Saving failed: ${log.stats.error}. The data stays in memory and is tried again.`);
+  return w.join(' ');
+}
+
+// Smallest 1, 2 or 5 x 10^n at or above v, so the scale labels stay round
+function niceCeil(v) {
+  const p = 10 ** Math.floor(Math.log10(v));
+  return [1, 2, 5, 10].find((m) => m * p >= v) * p;
+}
+
+function draw(t) {
+  const { canvas, ctx, ring, written } = t;
+  const dpr = devicePixelRatio || 1;
+  const W = Math.round(canvas.clientWidth * dpr), H = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width !== W || canvas.height !== H) {
+    canvas.width = W;
+    canvas.height = H;
+  }
+  // One min/max pair per pixel column; ring[written % RING] is the oldest sample
+  const lo = new Float32Array(W), hi = new Float32Array(W);
+  let peak = 0;
+  for (let x = 0; x < W; x++) {
+    let a = Infinity, b = -Infinity;
+    // At least one sample per column: the 5000-sample ring can be narrower than the canvas
+    for (let k = Math.floor((x * RING) / W), e = Math.max(k + 1, Math.floor(((x + 1) * RING) / W)); k < e; k++) {
+      const v = ring[(written + k) % RING];
+      if (v < a) a = v;
+      if (v > b) b = v;
+    }
+    lo[x] = a;
+    hi[x] = b;
+    peak = Math.max(peak, -a, b);
+  }
+  // Symmetric around 0 and never below the peak, so no beat is clipped
+  const full = (t.full = niceCeil(Math.max(peak, MIN_FULL)));
+  const pad = 16 * dpr;
+  const y = (c) => H / 2 - (c / full) * (H / 2 - pad);
+
+  const grid = [1, 0.5, 0, -0.5, -1].map((f) => [f * full, Math.round(y(f * full))]);
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#d0d0d0';
+  for (const [, yy] of grid) ctx.fillRect(0, yy, W, dpr);
+  ctx.beginPath();
+  for (let x = 0; x < W; x++) {
+    ctx.lineTo(x + 0.5, y(hi[x]));
+    ctx.lineTo(x + 0.5, y(lo[x]));
+  }
+  ctx.lineWidth = dpr;
+  ctx.strokeStyle = '#b00020';
+  ctx.stroke();
+  // Labels last, with a white halo, so the trace never hides them
+  ctx.font = `${13 * dpr}px system-ui, sans-serif`;
+  ctx.lineWidth = 4 * dpr;
+  ctx.strokeStyle = '#fff';
+  ctx.fillStyle = '#222';
+  for (const [c, yy] of grid) {
+    ctx.strokeText(`${c} ${t.unit}`, 4 * dpr, yy - 3 * dpr);
+    ctx.fillText(`${c} ${t.unit}`, 4 * dpr, yy - 3 * dpr);
+  }
+}
+
+function tick() {
+  requestAnimationFrame(tick);
+  const now = performance.now();
+  if (dirty) {
+    dirty = false;
+    for (const t of traces) draw(t);
+  }
+  if (session?.ecgStats.frames) setText(leads, leadIILine(session.ecgStats));
+  setText(warn, warnings(now));
+  if (session && now - t0 >= 1000) {
+    const per = 1000 / (now - t0), frames = session.ecgStats.frames;
+    stats.textContent = `${Math.round((frames - f0) * per)} ECG frames/s, ${Math.round((pcgTrace.written - w0) * per)} PCG samples/s, `
+      + `${session.pcgStats.drops} PCG frames dropped, ${session.ecgStats.skippedAfterLock} ECG bytes lost after lock, `
+      + `${mmss(now - started)} recorded, ${log.stats.saved} files saved, scale ECG ±${ecgTrace.full} counts, PCG ±${pcgTrace.full} mV.`;
+    t0 = now;
+    f0 = frames;
+    w0 = pcgTrace.written;
+  }
+}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>

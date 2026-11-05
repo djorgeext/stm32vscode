@@ -207,5 +207,5 @@ export function startSession({ ecgPort, pcgPort, log, now, onPcg, onEcg, onLost 
 
   const stop = () => (stopped ??= halt());
   const done = loops.then(() => stopped ?? log.flush());
-  return { stop, done };
+  return { stop, done, ecgStats: chain.stats, pcgStats: parser.stats };
 }
