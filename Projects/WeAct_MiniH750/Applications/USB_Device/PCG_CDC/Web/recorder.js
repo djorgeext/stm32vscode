@@ -24,7 +24,7 @@ export function record(kind, t, bytes) {
 
 // save(index, blob) is async. Files are saved one at a time, in order, and a failed one stays first in line
 export function createLog(save) {
-  // shortcut: unsaved segments stay in memory with no cap, 100-200 MB per hour of failed writes; add a cap if disks ever fill mid-recording
+  // shortcut: unsaved segments stay in memory with no cap, about 600 MB per hour of failed writes (estimated); add a cap if disks ever fill mid-recording
   const queue = [];
   const stats = { saved: 0, unsaved: 0, error: '' };
   let open = [], size = 0, next = 1, running = null;
@@ -162,7 +162,8 @@ export function startSession({ ecgPort, pcgPort, log, now, onPcg, onEcg, onLost 
     try {
       y = chain.push(value);
     } finally {
-      log.add(t, [ECG, value], [ECG_1K, new Uint8Array(y.buffer, y.byteOffset, y.byteLength)]); // the raw bytes outlive a parser bug
+      const samples = y.length ? [[ECG_1K, new Uint8Array(y.buffer, y.byteOffset, y.byteLength)]] : []; // most chunks complete no frame
+      log.add(t, [ECG, value], ...samples); // the raw bytes outlive a parser bug
     }
     // Counted, as Chrome throttles timers in hidden tabs
     if (chain.stats.frames >= keepAliveAt) {

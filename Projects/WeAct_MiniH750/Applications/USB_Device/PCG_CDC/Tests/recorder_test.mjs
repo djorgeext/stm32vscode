@@ -377,6 +377,60 @@ test('a non-fatal read error is logged between the two runs of records, and read
   }
 });
 
+test('a chunk writes a kind 4 record only if it gave samples, with its t, and the raw bytes are all logged, even past a parser bug', async () => {
+  const h = session();
+  const { ecg } = h;
+  let tick = 0;
+  Object.defineProperty(h, 'clock', { get: () => ++tick });
+  await h.startDone();
+
+  // Two-byte chunks, the median S10 saw, and each size of output: none, one sample (the first frame), two, and many
+  const twoBytes = (b) => Array.from({ length: b.length >> 1 }, (_, k) => b.subarray(2 * k, 2 * k + 2));
+  const chunks = [
+    new Uint8Array(30).fill(0x11), ecgFrames(0, 1), ...twoBytes(ecgFrames(1, 3)), ecgFrames(4, 5),
+    ecgFrames(9, 1).subarray(0, 23), ecgFrames(10, 1).subarray(0, 39), ecgFrames(10, 1).subarray(39), ...twoBytes(ecgFrames(11, 2)),
+  ];
+  const chain = createEcgChain(), outputs = chunks.map((c) => chain.push(c));
+  assert.ok(outputs.filter((y) => y.length === 0).length >= 50, 'most chunks give nothing');
+  for (const size of [1, 2, 10]) assert.ok(outputs.some((y) => y.length === size), `a chunk giving ${size}`);
+  assert.equal(outputs.reduce((n, y) => n + y.length, 0), 2 * chain.stats.frames - 1);
+
+  // A plain array makes chain.push throw before the first frame, as a parser bug would
+  const bug = [0x55, 0x66, 0x77];
+  ecg.feed(bug);
+  for (const c of chunks) ecg.feed(c);
+  await until(() => h.ecgSeen.length === 2 * chain.stats.frames - 1, 'all the samples');
+  assert.equal(await h.s.stop(), true);
+
+  const all = h.records(), ecgOnly = all.filter((r) => r.kind === ECG || r.kind === ECG_1K);
+  assert.deepEqual(ecgOnly.filter((r) => r.kind === ECG).map((r) => Array.from(r.payload)), [bug, ...chunks.map((c) => Array.from(c))]);
+  assert.ok(eventsOf(all).some((e) => e.e === 'read-error'), 'the bug shows in the file');
+
+  let i = 0;
+  for (const [k, y] of [new Float32Array(0), ...outputs].entries()) {
+    const raw = ecgOnly[i++];
+    assert.equal(raw.kind, ECG, `chunk ${k}: its raw record comes first`);
+    if (y.length) {
+      const samples = ecgOnly[i++];
+      assert.equal(samples?.kind, ECG_1K, `chunk ${k} gave ${y.length} samples and wrote no kind 4 record`);
+      assert.equal(samples.t, raw.t, `chunk ${k}: kind 4 keeps the t of its kind 2 record`);
+      assert.deepEqual(Array.from(samples.payload), Array.from(new Uint8Array(y.buffer)), `chunk ${k}`);
+    }
+  }
+  assert.equal(i, ecgOnly.length, 'a kind 4 record that holds no samples');
+
+  // The real session's files through the real loader
+  const r = await recording();
+  const folder = path.join(r.dir, 'from-session'), out = path.join(r.dir, 'from-session-dump');
+  await fs.mkdir(folder);
+  await fs.mkdir(out);
+  for (const f of h.files) await fs.writeFile(path.join(folder, segmentName(f.index)), f.bytes);
+  const s = summaryOf(folder);
+  assert.deepEqual([s.ecg_frames, s.ecg_1k_ok, s.errors], [chain.stats.frames, true, []]);
+  dump(folder, out);
+  assert.equal(Buffer.compare(await fs.readFile(path.join(out, 'ecg_1k.bin')), Buffer.concat(outputs.map(bytesOf))), 0);
+});
+
 test('both lost, even during START: done resolves with everything saved, with no Stop', async () => {
   const h = session();
   const { ecg, pcg, log, files, records } = h;
@@ -422,7 +476,7 @@ print(json.dumps({key: rec[key] for key in ('pcg_drops', 'ecg_resync', 'events',
 `;
 
 // 300 s of two streams on their own clocks, in the order a session logs them
-async function makeRecording(dir) {
+async function makeRecording(dir, oldDir) {
   let s = 20261105;
   const rand = () => (s = (Math.imul(s, 1103515245) + 12345) >>> 0) / 2 ** 32;
   const jitter = () => -Math.log(1 - rand()) * 2; // one-sided, mean 2 ms
@@ -491,31 +545,35 @@ async function makeRecording(dir) {
   emit(lostAt, { event: { e: 'lost', stream: 'pcg', message: 'The device has been lost.' } });
   emit(end + 1, { event: { e: 'stop' } });
 
-  // Written the way startSession writes them, and read by the real parsers too, so the loader has something to agree with
-  const file = createLog(saveTo(dir));
+  // Written the way startSession writes them, and read by the real parsers too, so the loader has something to agree with.
+  // old is the same log as recordings had it before S14, with a kind 4 record for every kind 2 record, empty or not
+  const file = createLog(saveTo(dir)), old = createLog(saveTo(oldDir));
   const chain = createEcgChain();
   const pcgParser = createPcgParser();
   const ecg1k = new Float32Array(2 * (M - 1) - 1);
   let o = 0, keepAliveAt = 30000, keepAlives = 0;
   for (const c of log.sort((a, b) => a.t - b.t)) {
-    if (c.event) file.event(c.t, c.event);
+    if (c.event) for (const f of [file, old]) f.event(c.t, c.event);
     if (c.pcg) {
-      file.add(c.t, [PCG, c.pcg]);
+      for (const f of [file, old]) f.add(c.t, [PCG, c.pcg]);
       pcgParser.push(c.pcg);
     }
     if (c.ecg) {
       const y = chain.push(c.ecg);
-      file.add(c.t, [ECG, c.ecg], [ECG_1K, new Uint8Array(y.buffer, y.byteOffset, y.byteLength)]);
+      const samples = new Uint8Array(y.buffer, y.byteOffset, y.byteLength);
+      file.add(c.t, [ECG, c.ecg], ...(y.length ? [[ECG_1K, samples]] : []));
+      old.add(c.t, [ECG, c.ecg], [ECG_1K, samples]);
       ecg1k.set(y, o);
       o += y.length;
       if (chain.stats.frames >= keepAliveAt) {
         keepAliveAt += 30000;
         keepAlives++;
-        file.event(c.t, { e: 'keep-alive', frames: chain.stats.frames });
+        for (const f of [file, old]) f.event(c.t, { e: 'keep-alive', frames: chain.stats.frames });
       }
     }
   }
   assert.equal(await file.flush(), true);
+  assert.equal(await old.flush(), true);
 
   const kept = Array.from({ length: M }, (_, k) => k).filter((k) => k !== CUT);
   return {
@@ -540,8 +598,10 @@ async function recording() {
   if (!shared) {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'recorder-test-'));
     const folder = path.join(dir, 'recording');
+    const oldForm = path.join(dir, 'old-form');
     await fs.mkdir(folder);
-    shared = { dir, folder, ...(await makeRecording(folder)) };
+    await fs.mkdir(oldForm);
+    shared = { dir, folder, oldForm, ...(await makeRecording(folder, oldForm)) };
   }
   return shared;
 }
@@ -736,6 +796,19 @@ load_recording.write_export = damage
 load_recording.export(sys.argv[2])
 `;
 
+function exportWanted(r) {
+  const M = r.frames, N = r.expected.pcg.length, F = r.liveFrames;
+  return {
+    pcg: [Float32Array.from(r.expected.pcg), 'float32', [N]],
+    ecg_raw: [Float32Array.from(r.expected.ecg_ii), 'float32', [M]],
+    ecg_filtered: [r.expected.ecg_1k, 'float32', [2 * M - 1]],
+    pcg_frame_t: [r.expected.pcg_frame_t, 'float64', [F]],
+    ecg_frame_t: [r.expected.ecg_frame_t, 'float64', [M]],
+    pcg_frame_index: [r.expected.pcg_frame_index, 'int64', [F]],
+    ecg_resync: [BigInt64Array.of(BigInt(r.resyncFrame), 23n), 'int64', [1, 2]],
+  };
+}
+
 test('export: the four files match the recording byte for byte, beside it, and the recording stays as it was', async () => {
   const r = await recording();
   const source = await contents(r.folder);
@@ -755,15 +828,7 @@ test('export: the four files match the recording byte for byte, beside it, and t
   assert.equal((await fs.readFile(path.join(exported, 'timestamps.npz'))).readUInt16LE(8), 0, 'timestamps.npz is stored, not compressed');
   const M = r.frames, N = r.expected.pcg.length, F = r.liveFrames;
   assert.equal(N, 10 * F);
-  const wanted = {
-    pcg: [Float32Array.from(r.expected.pcg), 'float32', [N]],
-    ecg_raw: [Float32Array.from(r.expected.ecg_ii), 'float32', [M]],
-    ecg_filtered: [r.expected.ecg_1k, 'float32', [2 * M - 1]],
-    pcg_frame_t: [r.expected.pcg_frame_t, 'float64', [F]],
-    ecg_frame_t: [r.expected.ecg_frame_t, 'float64', [M]],
-    pcg_frame_index: [r.expected.pcg_frame_index, 'int64', [F]],
-    ecg_resync: [BigInt64Array.of(BigInt(r.resyncFrame), 23n), 'int64', [1, 2]],
-  };
+  const wanted = exportWanted(r);
   assert.deepEqual(Object.keys(shapes).sort(), Object.keys(wanted).sort());
   for (const [key, [want, dtype, shape]] of Object.entries(wanted)) {
     assert.deepEqual(shapes[key], [dtype, shape], key);
@@ -892,4 +957,52 @@ test('export: damage to any file exits non-zero, names the place, and never reac
   assert.ok(await exists(exported));
   assert.equal(await exists(partial), false);
   assert.deepEqual(await contents(r.folder), source);
+});
+
+test('both forms: empty kind 4 records change nothing in load(), summary or --export, and are the only difference', async () => {
+  const r = await recording();
+  const recordsIn = async (dir) => (await Promise.all((await fs.readdir(dir)).sort().map(async (name) => parseRecords(new Uint8Array(await fs.readFile(path.join(dir, name))))))).flat();
+  const isEmpty = (x) => x.kind === ECG_1K && x.payload.length === 0;
+  const count = (records, kind) => records.filter((x) => x.kind === kind).length;
+  const fresh = await recordsIn(r.folder), old = await recordsIn(r.oldForm);
+
+  assert.equal(fresh.filter(isEmpty).length, 0);
+  const empties = old.filter(isEmpty).length;
+  assert.ok(empties > 10000, `${empties} empty records in the old form`);
+  assert.equal(count(old, ECG_1K), count(old, ECG), 'the old form has a kind 4 record for every kind 2 record');
+  assert.equal(count(fresh, ECG_1K), count(old, ECG) - empties);
+  assert.ok(count(fresh, ECG_1K) < count(fresh, ECG));
+  const rest = old.filter((x) => !isEmpty(x));
+  assert.equal(rest.length, fresh.length);
+  fresh.forEach((x, k) => assert.ok(x.t === rest[k].t && x.kind === rest[k].kind && Buffer.compare(x.payload, rest[k].payload) === 0, `record ${k} differs`));
+
+  const reports = [];
+  for (const [name, folder] of [['fresh', r.folder], ['old', r.oldForm]]) {
+    const out = path.join(r.dir, `${name}-form-dump`);
+    await fs.mkdir(out);
+    const rec = dump(folder, out);
+    for (const [key, want] of Object.entries(r.expected)) assert.equal(Buffer.compare(await fs.readFile(path.join(out, `${key}.bin`)), bytesOf(want)), 0, `${name}: ${key} differs`);
+    assert.deepEqual([rec.errors, rec.missing_segments, rec.pcg_drops, rec.ecg_resync], [[], [], 2, [[r.resyncFrame, 23]]]);
+    const { segments, ...report } = summaryOf(folder);
+    assert.equal(report.ecg_1k_ok, true, name);
+    reports.push(report);
+
+    const y = new Float32Array(new Uint8Array(await fs.readFile(path.join(out, 'ecg_1k.bin'))).buffer);
+    const f = createEcgFilter();
+    assert.equal(y.length, 2 * r.expected.ecg_ii.length - 1, `${name}: 2M - 1 values`);
+    r.expected.ecg_ii.forEach((v, m) => assert.ok(y[2 * m] === Math.fround(f(v)), `${name}: ecg_1k[2m] is frame ${m}`));
+
+    // A copy, because the export tests own <folder>-export
+    const copy = path.join(r.dir, `${name}-form-copy`), exportDump = path.join(r.dir, `${name}-form-export-dump`);
+    await fs.cp(folder, copy, { recursive: true });
+    await fs.mkdir(exportDump);
+    const exported = exportOf(copy);
+    assert.equal(exported.status, 0, exported.stderr);
+    const shapes = dumpExport(`${copy}-export`, exportDump);
+    for (const [key, [want, dtype, shape]] of Object.entries(exportWanted(r))) {
+      assert.deepEqual(shapes[key], [dtype, shape], `${name}: ${key}`);
+      assert.equal(Buffer.compare(await fs.readFile(path.join(exportDump, `${key}.bin`)), bytesOf(want)), 0, `${name}: ${key} differs`);
+    }
+  }
+  assert.deepEqual(reports[0], reports[1]);
 });

@@ -11,7 +11,8 @@ little-endian records, and a file only ever ends on a record boundary:
     kind 1  PCG bytes as received: 24-byte frames [0x8000 sync][seq 0-32767, wrapping][10 int16 samples], cut anywhere
     kind 2  ECG bytes as received: 40-byte frames (Biomedic_ECG_USB_protocol.md section 8), cut anywhere
     kind 3  event, UTF-8 JSON, named by its field e: start, ecg-start-sent, keep-alive, read-error, lost, stop
-    kind 4  filtered lead II upsampled to 1000 Hz, f32, continuing the previous kind 4 record, same t as its kind 2 record
+    kind 4  filtered lead II upsampled to 1000 Hz, f32, continuing the previous kind 4 record, same t as its kind 2 record.
+            A chunk that completes no frame has none, and older recordings hold an empty one there, which adds nothing
 
 load(folder) returns the arrays below and never raises on a damaged recording: what it cannot use goes in errors.
 

@@ -105,8 +105,8 @@ outside the repo, because recordings are health data. Later Starts use the same 
 
 Always end with Stop: it stops the module, drains that command and writes the last file. If a save fails, the data stays
 in memory, the page warns, and the save is tried again at the next file and at Stop. If it still fails, the button reads
-Retry save, so keep the tab open and click it. Files go to disk every 256 KiB (about every 0.9 s), so a crash or a killed tab loses
-about the last second, and it leaves the module streaming until the next Start. A crash can also leave a `.crswap`
+Retry save, so keep the tab open and click it. Files go to disk every 256 KiB (about every 1.6 s, an estimate), so a crash or a killed tab loses
+about that much, and it leaves the module streaming until the next Start. A crash can also leave a `.crswap`
 file in the folder, which is health data too: delete it.
 
 ### Recording format
@@ -126,7 +126,7 @@ little-endian records, and a file only ever ends on a record boundary.
 | 1 | PCG bytes exactly as received: 24-byte frames, cut wherever the chunk was cut |
 | 2 | ECG bytes exactly as received: 40-byte frames, cut wherever the chunk was cut |
 | 3 | Event, UTF-8 JSON |
-| 4 | Filtered, upsampled lead II as f32, continuing the previous kind 4 record. Same `t` as the kind 2 record it came from |
+| 4 | Filtered, upsampled lead II as f32, continuing the previous kind 4 record. Same `t` as the kind 2 record it came from. Written only when that chunk gave samples. Older recordings hold an empty one for every other chunk, and the loader reads both |
 
 | Event `e` | When | Other fields |
 |---|---|---|

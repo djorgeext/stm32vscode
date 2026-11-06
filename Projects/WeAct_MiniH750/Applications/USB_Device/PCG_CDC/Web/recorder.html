@@ -5,19 +5,81 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ECG and PCG recorder</title>
 <style>
-  body { font: 16px/1.5 system-ui, sans-serif; margin: 1rem; color: #111; background: #fff; }
-  button { font: inherit; padding: 0.4rem 1.2rem; }
-  button:focus-visible { outline: 3px solid #0b57d0; outline-offset: 2px; }
-  #status { font-size: 1.1rem; }
-  #warn { color: #b00020; font-weight: 600; }
-  figure { margin: 0; }
-  canvas { display: block; width: 100%; height: 34vh; border: 1px solid #767676; }
-  h2 { font-size: 1.1rem; margin: 0.5rem 0 0.25rem; }
+  :root {
+    --page: #f5f5f7; --card: #fff; --text: #1d1d1f; --secondary: #6e6e73; --hairline: rgba(0, 0, 0, .08); --quiet: #e8e8ed;
+    --accent: #0a70ec; /* white text on it reaches 4.5:1 */
+    --ring: rgba(10, 112, 236, .8); /* 3:1 against the bar, the least that still shows focus */
+    --warn: #b3261e; --warn-tint: #fdecea;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--page); color: var(--text); -webkit-font-smoothing: antialiased;
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", system-ui, sans-serif;
+  }
+  header {
+    position: sticky; top: 0; z-index: 1; border-bottom: 1px solid var(--hairline);
+    background: rgba(255, 255, 255, .72); backdrop-filter: saturate(180%) blur(20px);
+  }
+  .bar, main { max-width: 1280px; margin: 0 auto; padding-inline: 28px; }
+  .bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 24px; padding-block: 12px; }
+  .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+  h1 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -.02em; }
+  label, output { font-size: 13px; font-weight: 500; color: var(--secondary); }
+  output { display: inline-block; min-width: 30px; } /* a wider "10 s" must not move the slider under the pointer */
+  #volumeValue { min-width: 44px; }
+
+  button {
+    padding: 7px 18px; border: 0; border-radius: 999px; font: inherit; font-weight: 500; color: var(--text); background: var(--quiet);
+    transition: filter .15s, opacity .15s, transform .1s;
+  }
+  #start:not(.quiet) { color: #fff; background: var(--accent); }
+  button:hover:not(:disabled) { filter: brightness(.95); }
+  button:active:not(:disabled) { filter: brightness(.9); transform: scale(.98); }
+  button:disabled { opacity: .45; }
+  button:focus-visible, input:focus-visible { outline: 3px solid var(--ring); outline-offset: 2px; }
+
+  input { --fill: 44.44%; appearance: none; width: 140px; height: 20px; margin: 0 4px; border-radius: 999px; background: none; vertical-align: middle; }
+  input::-webkit-slider-runnable-track {
+    height: 4px; border-radius: 999px; background: linear-gradient(to right, var(--accent) var(--fill), var(--quiet) var(--fill));
+  }
+  input::-webkit-slider-thumb {
+    appearance: none; width: 18px; height: 18px; margin-top: -7px; border-radius: 50%; background: #fff;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, .3), 0 0 0 .5px rgba(0, 0, 0, .12);
+  }
+
+  #volume { --fill: 33.33%; }
+
+  main { padding-block: 16px 28px; }
+  main > p { margin: 0 0 4px; font-size: 13px; color: var(--secondary); }
+  main > p:empty { margin: 0; } /* not display: none, which takes a live region out of the accessibility tree, so a new warning goes unannounced */
+  #msg { color: var(--text); }
+  #warn { color: var(--warn); font-weight: 600; }
+  #warn:not(:empty) { margin-block: 8px; padding: 8px 16px; border-radius: 14px; background: var(--warn-tint); }
+
+  figure { margin: 12px 0 0; }
+  .card { padding: 14px 18px 16px; border-radius: 18px; background: var(--card); box-shadow: 0 1px 2px rgba(0, 0, 0, .04), 0 8px 24px rgba(0, 0, 0, .05); }
+  .card + .card { margin-top: 16px; }
+  h2 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
+  canvas { display: block; width: 100%; height: calc(50vh - 175px); min-height: 180px; } /* both cards fit a 1080p window, warning included */
+  figcaption { margin-top: 16px; padding-inline: 4px; font-size: 12px; color: var(--secondary); }
 </style>
 </head>
 <body>
-<h1>ECG and PCG recorder</h1>
-<p><button id="allow" type="button">Allow device</button> <button id="start" type="button" disabled>Start</button></p>
+<header>
+  <div class="bar">
+    <h1>ECG and PCG recorder</h1>
+    <div class="controls">
+      <span><label>Window <input id="seconds" type="range" min="1" max="10" step="1" value="5" autocomplete="off"></label> <output id="secondsValue">5 s</output></span>
+      <span><label>Volume <input id="volume" type="range" min="0" max="300" step="10" value="100" autocomplete="off"></label> <output id="volumeValue">100 %</output></span>
+      <div class="controls">
+        <button id="allow" type="button">Allow device</button>
+        <button id="audio" type="button" disabled>Start audio</button>
+        <button id="start" type="button" disabled>Start</button>
+      </div>
+    </div>
+  </div>
+</header>
+<main>
 <p id="devices" role="status"></p>
 <p id="status"><span id="msg" role="status">Starting. If this stays, serve the page from the repo root with
   <code>python3 -m http.server -b 127.0.0.1 -d Projects/WeAct_MiniH750/Applications/USB_Device/PCG_CDC/Web 8001</code>
@@ -25,19 +87,26 @@
 <p id="leads" role="status"></p>
 <p id="warn" role="status"></p>
 <figure>
-  <h2>ECG lead II (LL − RA)</h2>
-  <canvas id="traceEcg" role="img" aria-label="Live ECG, lead II, last 5 seconds, newest on the right"></canvas>
-  <h2>PCG</h2>
-  <canvas id="tracePcg" role="img" aria-label="Live PCG, last 5 seconds, newest on the right"></canvas>
+  <div class="card">
+    <h2>ECG lead II (LL − RA)</h2>
+    <canvas id="traceEcg" role="img" aria-label="Live ECG, lead II, newest on the right"></canvas>
+  </div>
+  <div class="card">
+    <h2>PCG</h2>
+    <canvas id="tracePcg" role="img" aria-label="Live PCG, newest on the right"></canvas>
+  </div>
   <figcaption>ECG lead II with the forward-only filters, upsampled to 1000 Hz by linear interpolation. PCG band-passed
-    20–200 Hz and reduced to 1000 Hz on the board. Last 5 s, newest on the right. <span id="note"></span></figcaption>
+    20–200 Hz and reduced to 1000 Hz on the board. Newest on the right. <span id="note"></span></figcaption>
 </figure>
+</main>
 <script type="module">
 import { createLog, startSession, findPorts, leadIILine, ECG_PORT, PCG_PORT, ALIGN_NOTE } from './recorder.js';
+import { createUpsampler } from './upsample.js';
 
-const RING = 5000; // 5 s at 1000 Hz
+const RING = 10000; // 10 s at 1000 Hz, the longest window
 const MIN_FULL = 50; // counts for ECG, mV for PCG: a quiet trace stays flat instead of filling the height
 const MV_PER_COUNT = 3300 / 65536;
+const AUDIO_VOLUME = 1; // the worklet's 0.1 was too low at full system volume, and heart sounds peak well under the player's clamp
 const NAMES = { ecg: 'ECG module', pcg: 'PCG board' };
 const LABELS = { idle: 'Start', starting: 'Start', recording: 'Stop', stopping: 'Stop', retry: 'Retry save', saving: 'Retry save' };
 
@@ -45,20 +114,24 @@ let state = 'idle', allowing = false, found = { ecg: null, pcg: null };
 let dir = null, folderName = '', log = null, session = null;
 let lost = [], last = { ecg: 0, pcg: 0 }, started = 0, length = '';
 let dirty = true, t0 = 0, f0 = 0, w0 = 0;
+let audio = null, audioStarting = false, audioError = '';
 
 const allowBtn = document.getElementById('allow');
 const startBtn = document.getElementById('start');
+const audioBtn = document.getElementById('audio');
 const devices = document.getElementById('devices');
 const msg = document.getElementById('msg');
 const stats = document.getElementById('stats');
 const leads = document.getElementById('leads');
 const warn = document.getElementById('warn');
-const trace = (id, unit) => {
+const seconds = document.getElementById('seconds');
+const volume = document.getElementById('volume');
+const trace = (id, unit, color) => {
   const canvas = document.getElementById(id);
-  return { canvas, ctx: canvas.getContext('2d'), ring: new Float32Array(RING), written: 0, full: MIN_FULL, unit };
+  return { canvas, ctx: canvas.getContext('2d'), ring: new Float32Array(RING), written: 0, full: MIN_FULL, unit, color };
 };
-const ecgTrace = trace('traceEcg', 'counts');
-const pcgTrace = trace('tracePcg', 'mV');
+const ecgTrace = trace('traceEcg', 'counts', '#0a70ec');
+const pcgTrace = trace('tracePcg', 'mV', '#e0565b');
 const traces = [ecgTrace, pcgTrace];
 
 document.getElementById('note').textContent = ALIGN_NOTE;
@@ -75,8 +148,20 @@ if (!('serial' in navigator) || !('showDirectoryPicker' in window)) {
 }
 
 allowBtn.addEventListener('click', allow);
+audioBtn.addEventListener('click', () => (audio ? stopAudio() : startAudio()));
 startBtn.addEventListener('click', () => (state === 'recording' ? stop() : state === 'retry' ? retry() : start()));
 addEventListener('resize', () => (dirty = true));
+const fill = (slider) => slider.style.setProperty('--fill', `${((slider.value - slider.min) / (slider.max - slider.min)) * 100}%`);
+seconds.addEventListener('input', () => {
+  fill(seconds);
+  document.getElementById('secondsValue').textContent = `${seconds.value} s`;
+  dirty = true;
+});
+volume.addEventListener('input', () => {
+  fill(volume);
+  document.getElementById('volumeValue').textContent = `${volume.value} %`;
+  audio?.gain.gain.setTargetAtTime(volume.value / 100, audio.ctx.currentTime, 0.02); // a glide, because a jump clicks
+});
 addEventListener('beforeunload', (e) => {
   if (session || state === 'retry' || state === 'saving') e.preventDefault();
 });
@@ -95,13 +180,60 @@ const folderFor = (d) =>
 // Both buttons are set only here, from the state, so an unplug during a recording cannot disable Stop
 function render() {
   startBtn.textContent = LABELS[state];
+  startBtn.className = state === 'retry' || state === 'saving' ? 'quiet' : '';
   startBtn.disabled = state === 'idle' ? !(found.ecg && found.pcg) : state !== 'recording' && state !== 'retry';
   allowBtn.disabled = allowing || state !== 'idle';
+  audioBtn.textContent = audio ? 'Stop audio' : 'Start audio';
+  audioBtn.disabled = audioStarting || !hearing();
 }
+
+const hearing = () => state === 'recording' && !lost.some(([name]) => name === 'pcg');
 
 function setState(next) {
   state = next;
+  if (next !== 'recording') stopAudio();
   render();
+}
+
+// shortcut: this graph is copied from startAudio in index.html, share it if either page's sound ever changes
+async function startAudio() {
+  audioStarting = true;
+  audioError = '';
+  render();
+  let ctx = null;
+  try {
+    ctx = new AudioContext({ sampleRate: 48000 }); // inside the click, the autoplay rule
+    await ctx.audioWorklet.addModule('pcg_audio.js');
+    const node = new AudioWorkletNode(ctx, 'pcg-player', { numberOfInputs: 0, outputChannelCount: [1], parameterData: { volume: AUDIO_VOLUME } });
+    node.onprocessorerror = () => stopAudio('the player stopped');
+    // After the player, not in it, so its fade-out keeps working. Above 100 % loud peaks can clip what is heard, never what is recorded
+    const gain = new GainNode(ctx, { gain: volume.value / 100 });
+    // Removes the interpolator's images near 1 kHz, where the ear is most sensitive
+    node.connect(new BiquadFilterNode(ctx, { type: 'lowpass', frequency: 300, Q: -3 })).connect(gain).connect(ctx.destination);
+    if (hearing()) audio = { ctx, node, gain, up: createUpsampler(48) };
+    else ctx.close().catch(() => {}); // a Stop or a lost board came during the load
+  } catch (e) {
+    ctx?.close().catch(() => {});
+    audioError = e.message;
+  }
+  audioStarting = false;
+  render();
+  refocus(audioBtn);
+}
+
+// setState and onPcg's catch call this, so it must not throw
+function stopAudio(error = '') {
+  if (error) audioError = error;
+  const a = audio;
+  audio = null;
+  if (!a) return;
+  render();
+  try {
+    a.node.parameters.get('volume').setTargetAtTime(0, a.ctx.currentTime, 0.005);
+    setTimeout(() => a.ctx.close().catch(() => {}), 50);
+  } catch {
+    a.ctx.close().catch(() => {});
+  }
 }
 
 async function refresh() {
@@ -147,10 +279,17 @@ function onPcg(frames) {
   if (frames.length) last.pcg = performance.now();
   for (const s of frames) for (const v of s) pcgTrace.ring[pcgTrace.written++ % RING] = v * MV_PER_COUNT;
   dirty = true;
+  // onPcg runs inside readPort's try, so an audio throw would land in the recording as read-error events
+  try {
+    if (audio) for (const s of frames) audio.node.port.postMessage(Int16Array.from(Array.from(s).flatMap((v) => audio.up(v))));
+  } catch (e) {
+    stopAudio(e.message);
+  }
 }
 
 async function start() {
   setState('starting'); // disabled for the whole attempt, so a double click cannot start twice or stop
+  audioError = '';
   msg.textContent = dir ? 'Starting the recording…' : 'Choose a folder for the recordings, outside the repo. Chrome may refuse Documents itself, so make a subfolder.';
   const opened = [];
   let step = 'Folder', hint = '';
@@ -183,7 +322,11 @@ async function start() {
     }
     started = t0 = last.ecg = last.pcg = performance.now();
     f0 = w0 = 0;
-    session = startSession({ ecgPort: ecg, pcgPort: pcg, log, now: () => performance.now(), onPcg, onEcg, onLost: (name, message) => lost.push([name, message]) });
+    session = startSession({ ecgPort: ecg, pcgPort: pcg, log, now: () => performance.now(), onPcg, onEcg, onLost: (name, message) => {
+        lost.push([name, message]);
+        if (name === 'pcg') stopAudio();
+        render();
+      } });
     session.done.catch(() => false).then(ended); // a session that fails still holds its data, so it goes to Retry save
     setState('recording');
     msg.textContent = `Recording to ${folderName}. Click Stop to end it.`;
@@ -235,6 +378,7 @@ function warnings(now) {
     if (!lost.some(([name]) => name === 'pcg') && now - last.pcg > 3000) w.push('No PCG samples for over 3 s.');
   }
   if (log?.stats.error) w.push(`Saving failed: ${log.stats.error}. The data stays in memory and is tried again.`);
+  if (audioError) w.push(`Audio failed: ${audioError}. The recording is not affected.`);
   return w.join(' ');
 }
 
@@ -252,14 +396,15 @@ function draw(t) {
     canvas.width = W;
     canvas.height = H;
   }
-  // One min/max pair per pixel column; ring[written % RING] is the oldest sample
+  // One min/max pair per pixel column of the last n samples, oldest on the left
+  const n = seconds.value * 1000;
   const lo = new Float32Array(W), hi = new Float32Array(W);
   let peak = 0;
   for (let x = 0; x < W; x++) {
     let a = Infinity, b = -Infinity;
-    // At least one sample per column: the 5000-sample ring can be narrower than the canvas
-    for (let k = Math.floor((x * RING) / W), e = Math.max(k + 1, Math.floor(((x + 1) * RING) / W)); k < e; k++) {
-      const v = ring[(written + k) % RING];
+    // At least one sample per column: the window can be narrower than the canvas
+    for (let k = Math.floor((x * n) / W), e = Math.max(k + 1, Math.floor(((x + 1) * n) / W)); k < e; k++) {
+      const v = ring[(written + RING - n + k) % RING];
       if (v < a) a = v;
       if (v > b) b = v;
     }
@@ -274,7 +419,7 @@ function draw(t) {
 
   const grid = [1, 0.5, 0, -0.5, -1].map((f) => [f * full, Math.round(y(f * full))]);
   ctx.clearRect(0, 0, W, H);
-  ctx.fillStyle = '#d0d0d0';
+  ctx.fillStyle = '#eeeef0';
   for (const [, yy] of grid) ctx.fillRect(0, yy, W, dpr);
   ctx.beginPath();
   for (let x = 0; x < W; x++) {
@@ -282,13 +427,13 @@ function draw(t) {
     ctx.lineTo(x + 0.5, y(lo[x]));
   }
   ctx.lineWidth = dpr;
-  ctx.strokeStyle = '#b00020';
+  ctx.strokeStyle = t.color;
   ctx.stroke();
   // Labels last, with a white halo, so the trace never hides them
-  ctx.font = `${13 * dpr}px system-ui, sans-serif`;
+  ctx.font = `${12 * dpr}px -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", system-ui, sans-serif`;
   ctx.lineWidth = 4 * dpr;
   ctx.strokeStyle = '#fff';
-  ctx.fillStyle = '#222';
+  ctx.fillStyle = '#6e6e73';
   for (const [c, yy] of grid) {
     ctx.strokeText(`${c} ${t.unit}`, 4 * dpr, yy - 3 * dpr);
     ctx.fillText(`${c} ${t.unit}`, 4 * dpr, yy - 3 * dpr);
